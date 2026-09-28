@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 from openai import OpenAI
 from ollama import chat
@@ -30,19 +31,21 @@ except Exception:
 
 # tool_add_drawer stores one durable fact. Importing it redirects prints, so put them back.
 tool_add_drawer = None
+tool_list_drawers = None
 try:
     import os
     import sys
 
     saved_stdout = sys.stdout
     saved_stdout_fd = os.dup(1)
-    from mempalace.mcp_server import tool_add_drawer
+    from mempalace.mcp_server import tool_add_drawer, tool_list_drawers
 
     os.dup2(saved_stdout_fd, 1)
     sys.stdout = saved_stdout
     os.close(saved_stdout_fd)
 except Exception:
     tool_add_drawer = None
+    tool_list_drawers = None
 
 # Structured facts. If the graph cannot open, verbatim facts still save.
 kg = None
@@ -111,6 +114,22 @@ def fact_to_triple(fact):
         return None
     return subject, predicate, obj
 
+try:
+    soul = Path(__file__).with_name("SOUL.md").read_text(encoding="utf-8")
+except OSError:
+    soul = "You are TinyTalk, a helpful local assistant."
+
+# Exact questions that ask for the whole fact list, not one similar fact.
+MEMORY_INTROSPECTION_QUESTIONS = {
+    "what do you remember about me",
+    "what do you know about me",
+    "what have i told you",
+    "what facts do you remember about me",
+}
+
+def is_memory_introspection(text):
+    return text.strip().lower().rstrip("?.!").strip() in MEMORY_INTROSPECTION_QUESTIONS
+
 while True:
     user_prompt = input("You: ")
 
@@ -122,7 +141,29 @@ while True:
 
     # Memories are added to this request only. They are not stored in messages.
     request_messages = messages
-    if palace is not None:
+    if palace is not None and is_memory_introspection(user_prompt):
+        facts = []
+        try:
+            if tool_list_drawers is not None:
+                listed = tool_list_drawers(wing="tinytalk", room="facts", limit=100)
+                facts = [
+                    item.get("content_preview", "").strip()
+                    for item in listed.get("drawers", [])
+                    if item.get("content_preview", "").strip()
+                ]
+        except Exception:
+            facts = []
+        if facts:
+            request_messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "Saved user facts retrieved from TinyTalk's persistent memory:\n\n"
+                        + "\n\n".join(facts)
+                    ),
+                }
+            ] + messages
+    elif palace is not None:
         facts = []
         try:
             found = search_memories(
@@ -175,7 +216,7 @@ while True:
                 ] + messages
 
     chat_completion = client.chat.completions.create(
-    messages=request_messages,
+    messages=[{"role": "system", "content": soul}] + request_messages,
     model="llama3.2:3b",
 )
 
