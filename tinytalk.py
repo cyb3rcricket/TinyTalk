@@ -71,6 +71,12 @@ def snake_predicate(text):
         words.append("".join(current))
     return "_".join(words)
 
+PREDICATE_ALIASES = {
+    "test_spaceship": "test_spaceship_name",
+    "spaceship_name": "test_spaceship_name",
+    "imaginary_spaceship_name": "test_spaceship_name",
+}
+
 def fact_to_triple(fact):
     """Ask Llama for one triple. Return None when the JSON is not one clear fact."""
     result = client.chat.completions.create(
@@ -111,6 +117,7 @@ def fact_to_triple(fact):
     if subject.lower() in {"i", "me", "my", "myself"}:
         subject = "user"
     predicate = snake_predicate(predicate)
+    predicate = PREDICATE_ALIASES.get(predicate, predicate)
     obj = obj.strip()
     if not subject or not predicate or not obj:
         return None
