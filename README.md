@@ -1,411 +1,539 @@
 # TinyTalk
 
-TinyTalk is a small local conversational AI project for exploring how
-identity, memory, conversation, and structured knowledge can work together.
+TinyTalk started as me rebuilding one of my old college chatbot projects mostly because I wanted to refresh myself on some of the "under the hood" stuff.
 
-It started as a simple Llama chatbot running locally through Ollama.
+At first it was basically:
 
-It has gradually become an experiment in what happens when a small language
-model is given several distinct layers of continuity instead of treating
-everything as one giant chat history.
+> local Llama + Ollama + terminal = chatbot
 
-TinyTalk is intentionally small and inspectable. The goal is not to turn it
-into a giant agent framework. The goal is to understand what is happening
-under the hood.
+That was supposed to be the project.
+
+Then I started wondering what "memory" actually means for something like this.
+
+Then identity.
+
+Then old memories versus current facts.
+
+Then structured knowledge.
+
+And, well... here we are.
+
+TinyTalk is now a small local AI experiment built around a pretty simple question:
+
+**What happens if you stop treating an AI conversation like one giant pile of text and start separating identity, memory, history, and knowledge into different systems?**
+
+I'm deliberately trying to keep it small enough that I can still open the code and understand what the thing is actually doing.
+
+No giant agent framework. No 47 layers of abstraction.
+
+Just me poking at the machinery.
 
 ---
 
-## What TinyTalk Has Now
+## What it does right now
 
-TinyTalk currently combines several different kinds of context and memory.
+TinyTalk currently runs `llama3.2:3b` locally through Ollama.
 
-### Soul
+On top of that, I've slowly added a few different kinds of continuity.
 
-`SOUL.md` contains TinyTalk's persistent identity and behavioral instructions.
+### `SOUL.md`
 
-It answers questions like:
+TinyTalk has a separate identity file called `SOUL.md`.
 
-- Who is TinyTalk?
-- How should it communicate?
-- How should it treat uncertainty?
-- How should it think about memory and knowledge?
+It describes things like:
 
-The Soul is loaded once when TinyTalk starts and is sent as the first system
-message on every normal chat request.
+- who TinyTalk is
+- how it should communicate
+- how it should treat uncertainty
+- how it should think about memory
+- how it should think about its own knowledge
 
-It is deliberately separate from conversation history and memory.
+The important part is that the Soul is **not memory**.
 
-### Short-Term Conversation Context
+It isn't retrieved by similarity and it doesn't disappear when older chat turns fall out of context.
 
-TinyTalk keeps the most recent conversation turns in memory while it is
-running.
+It gets loaded as TinyTalk's system instructions every time it answers.
+
+The rough idea is:
 
 ```text
+Memory = what TinyTalk has learned
+
+Soul = who TinyTalk is supposed to be
+```
+
+---
+
+## Short-term context
+
+TinyTalk keeps the last 10 conversation turns active:
+
+```python
 MAX_TURNS = 10
+```
 
-Older turns are trimmed so the active conversation does not grow forever.
-Restarting TinyTalk clears this short-term context.
-Persistent Conversations
-Every completed exchange can be stored in MemPalace under:
+Once the conversation gets longer than that, older turns fall out of the live context.
+
+That's intentional.
+
+I wanted short-term conversation and long-term memory to be two different things instead of just feeding the model an endlessly growing transcript.
+
+---
+
+## Persistent conversation memory
+
+Completed conversations are saved through MemPalace in:
+
+```text
 tinytalk/conversations
+```
 
-These are verbatim conversation records that can be searched later when
-relevant.
-This allows TinyTalk to recover useful context from previous runs.
-Explicit Facts
-The command:
-Remember this: ...
+TinyTalk can search those old exchanges later when something from a previous conversation looks relevant.
 
-stores an explicit fact separately from ordinary conversation history.
-Example:
+So restarting the program clears the immediate chat window, but it doesn't necessarily mean TinyTalk forgot everything that happened before.
+
+---
+
+## Explicit facts
+
+There's also a stronger kind of memory.
+
+If I say:
+
+```text
 Remember this: my test spaceship is named Enterprise
+```
 
-Explicit facts are stored under:
+TinyTalk stores that separately in:
+
+```text
 tinytalk/facts
+```
 
-Normal questions retrieve these facts using semantic similarity.
-TinyTalk currently requires a fact similarity score of at least:
-0.45
+These are things I explicitly told it to remember, so TinyTalk treats them as stronger evidence than something it happens to recover from an old conversation.
 
-before the fact is injected into the model's context.
-This prevents unrelated memories from appearing in arbitrary conversations.
-Memory Introspection
-Semantic search works well for specific questions such as:
+For normal questions, it searches those facts semantically.
+
+Right now the minimum similarity score is:
+
+```python
+MIN_FACT_SIMILARITY = 0.45
+```
+
+If a memory doesn't clear that threshold, TinyTalk doesn't inject it into the answer.
+
+That came from discovering that "technically related" memories are not necessarily **usefully related** memories.
+
+---
+
+## "What do you remember about me?"
+
+This turned into its own problem.
+
+Semantic search works pretty well for:
+
+```text
 What is my test spaceship called?
+```
 
-but poorly for broad questions such as:
-What do you remember about me?
+because that question is semantically close to:
 
-Those questions are not necessarily similar to any one saved fact.
-TinyTalk therefore has a separate memory-introspection path for a small set
-of explicit questions, including:
-What do you remember about me?
-What do you know about me?
-What have I told you?
-What facts do you remember about me?
-
-Instead of similarity-searching one fact, TinyTalk lists the current facts
-room directly.
-Fact History and Supersession
-Some facts represent values that can change over time.
-For example:
-my test spaceship is named Picklewagon
-
-might later become:
-my test spaceship is named Serenity
-
-and later:
+```text
 my test spaceship is named Enterprise
+```
 
-For selected single-valued predicates, TinyTalk can treat the newer value as
-a replacement rather than allowing all values to remain current.
-Superseded verbatim facts can be moved to:
-tinytalk/facts-history
+But this:
 
-while the newest value remains in:
+```text
+What do you remember about me?
+```
+
+isn't particularly similar to any one fact.
+
+So TinyTalk now recognizes a few broad memory questions and directly reads the current fact list instead of trying to similarity-search it.
+
+That sounds obvious in hindsight.
+
+It was not obvious before I watched it fail. 😂
+
+---
+
+## Facts can change
+
+This was the next rabbit hole.
+
+Imagine I tell TinyTalk:
+
+```text
+my test spaceship is named Picklewagon
+```
+
+Then later:
+
+```text
+my test spaceship is named Serenity
+```
+
+Then:
+
+```text
+my test spaceship is named Enterprise
+```
+
+Those shouldn't necessarily become three equally valid current facts.
+
+For certain single-value relationships, TinyTalk now understands the idea of:
+
+```text
+old value -> historical
+new value -> current
+```
+
+Current explicit facts live in:
+
+```text
 tinytalk/facts
+```
 
-This preserves history without treating old information as current truth.
-Knowledge Graph
-When an explicit fact is saved, TinyTalk also attempts to convert it into a
-structured triple:
-subject -> predicate -> object
+Superseded ones can move into:
 
-For example:
+```text
+tinytalk/facts-history
+```
+
+The goal isn't to erase the past.
+
+It's to stop confusing **what used to be true** with **what TinyTalk currently believes is true**.
+
+---
+
+## Knowledge graph
+
+Explicit facts also get interpreted into simple structured relationships.
+
+Something like:
+
+```text
+my test spaceship is named Enterprise
+```
+
+can become:
+
+```text
 user -> test_spaceship_name -> Enterprise
+```
 
-The graph is powered by MemPalace's KnowledgeGraph.
-TinyTalk also normalizes some model-generated predicate names into canonical
-forms.
-For example:
+TinyTalk stores those relationships in MemPalace's knowledge graph.
+
+This created another fun problem: small language models don't always name relationships the same way.
+
+One run might produce:
+
+```text
 test_spaceship
+```
+
+another:
+
+```text
 spaceship_name
+```
+
+and another:
+
+```text
 imaginary_spaceship_name
+```
 
-all normalize to:
+So TinyTalk now normalizes those into a canonical relationship:
+
+```text
 test_spaceship_name
+```
 
-This keeps application logic from depending on the language model choosing
-the exact same label every time.
-The graph currently helps TinyTalk manage structured fact state and
-supersession. It is not yet used as a general question-answering source.
-Architecture
-Conceptually, TinyTalk currently looks like this:
-                       SOUL.md
-                          |
-                          v
-                      TinyTalk
-                          |
-             +------------+------------+
-             |            |            |
-             v            v            v
-       Recent Context   MemPalace   Knowledge Graph
-                          |
-                  +-------+--------+
-                  |                |
-                  v                v
-                Facts        Conversations
-                  |
-          +-------+--------+
-          |                |
-          v                v
-       Current        Fact History
-          |
-          +----------------------+
-                                 |
-                                 v
-                           Local LLM
-                         via Ollama
+That was one of those moments where the model wasn't exactly *wrong*.
 
-A useful mental model is:
+The software just needed to stop assuming the model would describe the same idea with the same words every single time.
+
+The knowledge graph currently helps manage structured facts and supersession.
+
+TinyTalk does **not** yet use the graph as a general answer source.
+
+---
+
+## The current mental model
+
+This is roughly how I'm thinking about TinyTalk now:
+
+```text
+                    SOUL.md
+                       |
+                       v
+                   TinyTalk
+                       |
+        +--------------+--------------+
+        |              |              |
+        v              v              v
+   Recent Chat      MemPalace    Knowledge Graph
+                       |
+               +-------+--------+
+               |                |
+               v                v
+             Facts        Conversations
+               |
+        +------+------+
+        |             |
+        v             v
+     Current        History
+```
+
+Or, in plain English:
+
+```text
 Soul
-= who TinyTalk is
+= who TinyTalk is supposed to be
 
 Context
-= what is happening right now
+= what we're talking about right now
 
 Facts
-= what the user explicitly told TinyTalk
+= things I explicitly told it
 
-Fact History
-= what used to be true
+Fact history
+= things that used to be true
 
 Conversations
 = what was actually said
 
-Knowledge Graph
-= structured relationships and temporal state
+Knowledge graph
+= structured relationships TinyTalk has learned
+```
 
-Running TinyTalk
-TinyTalk currently uses Ollama and llama3.2:3b.
-Requirements
+They're related.
+
+They aren't the same thing.
+
+That's kind of the whole experiment.
+
+---
+
+# Running it
+
+You'll need:
+
 - Python 3
 - Ollama
 - Llama 3.2 3B
 - MemPalace 3.10+
-- Python packages from requirements.txt
-Install the model:
+- the packages in `requirements.txt`
+
+Pull the model:
+
+```bash
 ollama pull llama3.2:3b
+```
 
-Install Python dependencies:
+Install dependencies:
+
+```bash
 pip install -r requirements.txt
+```
 
-Run TinyTalk:
+Run it:
+
+```bash
 python3 tinytalk.py
+```
 
-You should see:
+You'll get:
+
+```text
 🤖 Hello! I'm your Llama assistant, running locally. (Type 'quit' to exit)
 ------------------------------
 You:
+```
 
-Type:
-quit
+And that's TinyTalk.
 
-to exit.
-Example Memory Flow
-Save a fact:
-You: Remember this: my test spaceship is named Enterprise
+For now.
 
-Later, ask:
-You: What is my test spaceship called?
+---
 
-TinyTalk searches the explicit facts room and only uses facts that clear the
-similarity threshold.
-Ask instead:
-You: What do you remember about me?
+# Things that are still weird
 
-TinyTalk recognizes this as a memory-introspection question and lists the
-current saved facts instead of relying on semantic similarity.
-Why Separate These Layers?
-A language model does not automatically have one unified concept of
-"memory."
-Different problems require different mechanisms.
-A recent conversation turn is not the same thing as a durable fact.
-A durable fact is not the same thing as the original sentence that created it.
-A structured graph relationship is not the same thing as either of those.
-And none of them are the same thing as the instructions describing who
-TinyTalk should be.
-Keeping those layers separate makes TinyTalk easier to understand, inspect,
-debug, and experiment with.
-Current Limitations
-TinyTalk is still deliberately experimental.
-Some current limitations include:
-- The local model is only Llama 3.2 3B and sometimes produces inconsistent
-  structured labels or awkward explanations.
-- Predicate normalization currently covers only a small explicit alias set.
-- Only a small explicit set of predicates are treated as single-valued.
-- Fact-history migration for older test data is still manual.
-- Conversation-memory fallback and explicit fact retrieval are still separate
-  retrieval paths.
-- TinyTalk sometimes describes retrieved memory too literally, such as
-  referring to internal prompt sections.
-- The knowledge graph is not yet used to answer ordinary questions.
-- There is currently no web research capability.
-- content_preview returned by some MemPalace listing operations is limited
-  to 200 characters.
-- Memory writes and graph updates are not transactional.
-These are useful constraints for the project because they expose where memory
-systems become more complicated than simply storing text.
-Roadmap
-The roadmap is intentionally conservative. TinyTalk should stay small enough
-that its behavior can still be understood by reading the code.
-Near Term
-Clean Up Existing Test Memory
-Perform a one-time migration of the spaceship test facts:
-Picklewagon -> historical
-Serenity -> historical
-Enterprise -> current
+This is very much an experiment, and there are some rough edges.
 
-The goal is to verify that:
-What is my test spaceship called?
+A few of the interesting ones:
 
-returns Enterprise, while older names remain available as history.
-Improve Memory Provenance
-Make injected memory clearer to the model.
-TinyTalk should understand the distinction between:
-saved user fact
-retrieved conversation
-recent conversation
-model training knowledge
+- Llama 3.2 3B is fast and tiny, but sometimes gets weird with structured output or explanations.
+- Predicate normalization only covers relationships I've explicitly accounted for.
+- Only some facts are currently treated as single-value facts.
+- Some of my old test memories still need a one-time cleanup.
+- Conversation retrieval and explicit-fact retrieval still take separate paths.
+- TinyTalk occasionally exposes too much of its internal prompt plumbing when talking about its memories.
+- The knowledge graph isn't queried during normal conversation yet.
+- There is no live web research system.
+- Memory storage and graph updates aren't transactional.
 
-This should reduce responses such as:
-"I was trained on this fact"
+I'm not really trying to hide those edges.
 
-when the information was actually retrieved from MemPalace.
-Verify Fact Supersession End-to-End
-Test:
-Remember this: ...
+Finding them is half the reason I'm building this.
 
-across:
-- first value
-- duplicate value
-- changed value
-- historical value
-and verify both the verbatim fact store and knowledge graph remain coherent.
-Reduce Development Debug Noise
-Once memory behavior is stable, remove or gate temporary lines such as:
-[debug] fact similarity ...
-[debug] KG ...
+---
 
-while keeping an optional way to inspect memory behavior during development.
-Medium Term
-Model / Provider Switching
-Decouple TinyTalk from one hard-coded model.
-Possible brains may include:
-Ollama / local models
-Gemini
-other free or low-cost APIs
+# Roadmap
 
-TinyTalk's identity should remain:
+This isn't meant to be a rigid product roadmap.
+
+It's more of a **things I want to poke at next** list.
+
+## Next
+
+- [ ] Clean up the old Picklewagon -> Serenity -> Enterprise test-memory chain
+- [ ] Verify current vs. historical facts end-to-end
+- [ ] Improve memory provenance so TinyTalk knows whether something came from:
+  - an explicit fact
+  - an old conversation
+  - recent context
+  - its base model knowledge
+- [ ] Stop TinyTalk from saying things like "I was trained on this" when it actually retrieved something from memory
+- [ ] Gate or remove the temporary debug output once the memory system settles down
+
+## After that
+
+- [ ] Let the knowledge graph answer historical questions
+
+Example:
+
+```text
+What was my spaceship called before Enterprise?
+```
+
+- [ ] Improve coordination between:
+  - explicit facts
+  - conversation memory
+  - graph knowledge
+
+- [ ] Make the model/provider swappable
+
+I'd like TinyTalk itself to eventually be:
+
+```text
 Soul + Memory + Context + Knowledge
+```
 
-while the language model becomes an interchangeable inference engine.
-Historical Memory Questions
-Use the temporal knowledge graph to answer questions such as:
-What was my test spaceship called before Enterprise?
+while the model underneath it can change.
 
-without treating superseded information as current.
-Better Retrieval Coordination
-Explore allowing relevant information from multiple sources to contribute to
-one answer:
-explicit facts
-+
-conversation memory
-+
-structured graph state
+Maybe Llama.
 
-while preserving clear provenance.
-Optional Research Mode
-Potential command:
+Maybe Qwen.
+
+Maybe Gemini.
+
+Maybe something that doesn't exist yet.
+
+The model shouldn't have to **be** TinyTalk.
+
+It should just be one of the brains TinyTalk can use.
+
+## Research mode
+
+I've also been sketching out an optional command like:
+
+```text
 /research <question>
+```
 
-The goal would be current, grounded web research with preserved source
-citations.
-Research should remain separate from user facts:
+The idea would be to let TinyTalk do current web research with real source citations while keeping its personal memory system local.
+
+Research would get its own storage:
+
+```text
 tinytalk/research
+```
 
-A research record should eventually preserve:
-query
+and would keep things like:
+
+```text
+question
 timestamp
-model
 answer
 sources
-claim-to-source mappings
+claim -> source relationships
+```
 
-Research mode will remain on hold until a genuinely useful $0 cloud/search
-path is confirmed.
-Longer-Term Experiments
-Soul Evolution
-Allow TinyTalk to propose changes to SOUL.md without modifying it silently.
-Conceptually:
-TinyTalk notices recurring mismatch
-        |
-        v
-proposed Soul change
-        |
-        v
-user approval
-        |
-        v
-versioned SOUL.md update
+I'm putting this on hold until I find a cloud/search path I actually like that can stay at $0.
 
-The user should always remain in control of identity changes.
-Soul History
-Potentially preserve versions such as:
-soul/
-├── SOUL.md
-└── history/
-    ├── 0001-original.md
-    ├── 0002-more-concise.md
-    └── 0003-more-curious.md
+I don't want to bolt something onto the project just because I can.
 
-This would make personality evolution inspectable rather than invisible.
-Stronger Memory Provenance
-Eventually every retrieved piece of context could carry information such as:
-source
-timestamp
-memory type
-current/historical status
-confidence
+## Further out
 
-TinyTalk could then reason not only about a fact, but about where that fact
-came from.
-Research Recall and Freshness
-Stored research could eventually support:
-What did we find out about X?
+A few things I'm curious about:
 
-while detecting when externally sourced information may be stale enough to
-research again.
-Project Philosophy
-TinyTalk is not trying to become the biggest assistant.
-It is trying to make the machinery understandable.
-Every new feature should ideally answer a question about how AI systems work:
-How does identity persist?
+- [ ] letting TinyTalk propose changes to its own Soul
+- [ ] requiring human approval before any Soul change
+- [ ] versioning `SOUL.md`
+- [ ] stronger source/provenance tracking for memories
+- [ ] research recall and freshness
+- [ ] better temporal knowledge
+- [ ] seeing how different models behave when given the exact same Soul and memory
 
-How does memory differ from conversation history?
+That last one is especially interesting to me.
 
-How should old facts be replaced without erasing history?
+If Llama, Qwen, and Gemini all get:
 
-How does an AI know what it remembers?
-
-How should structured knowledge and verbatim memory interact?
-
-How can different models share the same identity and memory?
-
-If a feature makes those questions harder to understand without adding
-something meaningful, it probably does not belong in TinyTalk.
-Status
-TinyTalk is an active experimental project.
-Current focus:
-Soul
+```text
+SOUL.md
 +
-local conversation
+the same memories
 +
-persistent memory
-+
-fact history
-+
-temporal structured knowledge
+the same recent conversation
+```
 
-Cloud models, research, and more advanced agent behavior are intentionally
-secondary to keeping the core system small, understandable, and useful.
+and I ask:
+
+```text
+Who are you?
+```
+
+how much of "TinyTalk" survives the model swap?
+
+I want to find out.
+
+---
+
+# Why I'm building this
+
+I'm not really trying to make another ChatGPT.
+
+There are plenty of those.
+
+I'm more interested in the stuff underneath it.
+
+What actually counts as memory?
+
+What makes an assistant feel continuous from one conversation to the next?
+
+If something it remembers becomes wrong, should it overwrite it or remember that it **used to** be true?
+
+Is identity part of the model?
+
+The prompt?
+
+The memory?
+
+Some combination of all of them?
+
+What happens if you swap the model but keep everything else?
+
+I don't have some giant master plan for TinyTalk.
+
+I'm just following the interesting questions as they show up.
+
+Every time I think:
+
+> okay, that's probably enough
+
+something breaks in a way that makes me want to understand one more layer.
+
+So we'll see where it goes.
