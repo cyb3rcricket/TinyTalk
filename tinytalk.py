@@ -32,13 +32,14 @@ except Exception:
 # tool_add_drawer stores one durable fact. Importing it redirects prints, so put them back.
 tool_add_drawer = None
 tool_list_drawers = None
+tool_update_drawer = None
 try:
     import os
     import sys
 
     saved_stdout = sys.stdout
     saved_stdout_fd = os.dup(1)
-    from mempalace.mcp_server import tool_add_drawer, tool_list_drawers
+    from mempalace.mcp_server import tool_add_drawer, tool_list_drawers, tool_update_drawer
 
     os.dup2(saved_stdout_fd, 1)
     sys.stdout = saved_stdout
@@ -46,6 +47,7 @@ try:
 except Exception:
     tool_add_drawer = None
     tool_list_drawers = None
+    tool_update_drawer = None
 
 # Structured facts. If the graph cannot open, verbatim facts still save.
 kg = None
@@ -129,6 +131,36 @@ MEMORY_INTROSPECTION_QUESTIONS = {
 
 def is_memory_introspection(text):
     return text.strip().lower().rstrip("?.!").strip() in MEMORY_INTROSPECTION_QUESTIONS
+
+# Only these predicates have one current value. Everything else stays additive.
+SINGLE_VALUE_PREDICATES = {
+    "test_spaceship_name",
+    "favorite_vehicle",
+    "preferred_name",
+    "home_city",
+    "current_job",
+}
+
+def current_fact_objects(subject, predicate):
+    """Active KG objects for this subject and predicate."""
+    rows = kg.query_entity(subject)
+    return [
+        row.get("object")
+        for row in rows
+        if row.get("current") and row.get("predicate") == predicate and row.get("object")
+    ]
+
+def archive_replaced_fact(old_obj):
+    """Move the current verbatim fact that states old_obj into facts-history."""
+    if tool_list_drawers is None or tool_update_drawer is None or not old_obj:
+        return
+    listed = tool_list_drawers(wing="tinytalk", room="facts", limit=100)
+    needle = old_obj.lower()
+    for item in listed.get("drawers", []):
+        text = (item.get("content_preview") or "").lower()
+        drawer_id = item.get("drawer_id")
+        if drawer_id and needle in text:
+            tool_update_drawer(drawer_id, room="facts-history")
 
 while True:
     user_prompt = input("You: ")
@@ -238,25 +270,73 @@ while True:
     if palace is not None and user_prompt.lower().startswith("remember this:"):
         fact = user_prompt[len("remember this:"):].strip()
         if fact:
-            try:
-                saved = tool_add_drawer(
-                    wing="tinytalk",
-                    room="facts",
-                    content=fact,
-                    source_file="tinytalk",
-                    added_by="tinytalk",
-                )
-                if not saved.get("success"):
-                    print("Warning: could not save this fact to MemPalace.")
-            except Exception:
-                print("Warning: could not save this fact to MemPalace.")
+            triple = None
             if kg is not None:
                 try:
                     triple = fact_to_triple(fact)
-                    if triple:
-                        kg.add_triple(triple[0], triple[1], triple[2], source_file="tinytalk")
-                        print(f"[debug] KG: {triple[0]} -> {triple[1]} -> {triple[2]}")
+                except Exception:
+                    triple = None
+
+            save_fact = True
+            graph_action = "add" if triple else "skip"
+            if kg is not None and triple and triple[1] in SINGLE_VALUE_PREDICATES:
+                subject, predicate, obj = triple
+                try:
+                    current = current_fact_objects(subject, predicate)
+                except Exception:
+                    current = None
+                if current is None:
+                    graph_action = "add"
+                elif not current:
+                    graph_action = "add"
+                elif obj in current:
+                    save_fact = False
+                    graph_action = "skip"
+                    try:
+                        for old in current:
+                            if old == obj:
+                                continue
+                            kg.invalidate(subject, predicate, old)
+                            try:
+                                archive_replaced_fact(old)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        for old in current:
+                            if old == obj:
+                                continue
+                            kg.supersede(subject, predicate, old, obj, source_file="tinytalk")
+                            try:
+                                archive_replaced_fact(old)
+                            except Exception:
+                                pass
+                        graph_action = "supersede"
+                    except Exception:
+                        graph_action = "add"
+
+            if save_fact:
+                try:
+                    saved = tool_add_drawer(
+                        wing="tinytalk",
+                        room="facts",
+                        content=fact,
+                        source_file="tinytalk",
+                        added_by="tinytalk",
+                    )
+                    if not saved.get("success"):
+                        print("Warning: could not save this fact to MemPalace.")
+                except Exception:
+                    print("Warning: could not save this fact to MemPalace.")
+            if kg is not None and triple and graph_action == "add":
+                try:
+                    kg.add_triple(triple[0], triple[1], triple[2], source_file="tinytalk")
+                    print(f"[debug] KG: {triple[0]} -> {triple[1]} -> {triple[2]}")
                 except Exception:
                     pass
+            elif triple and graph_action == "supersede":
+                print(f"[debug] KG: {triple[0]} -> {triple[1]} -> {triple[2]}")
     print(f"Llama: {response}")
     print("-" * 30)
