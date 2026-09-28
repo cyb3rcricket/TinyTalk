@@ -1,3 +1,5 @@
+import json
+
 from openai import OpenAI
 from ollama import chat
 
@@ -10,6 +12,7 @@ print("🤖 Hello! I'm your Llama assistant, running locally. (Type 'quit' to ex
 print("-" * 30)
 
 MAX_TURNS = 10
+MIN_FACT_SIMILARITY = 0.45  # initial test value
 messages = []
 
 # Long-term memory. If MemPalace is missing or cannot open, keep chatting.
@@ -41,6 +44,73 @@ try:
 except Exception:
     tool_add_drawer = None
 
+# Structured facts. If the graph cannot open, verbatim facts still save.
+kg = None
+try:
+    from mempalace.knowledge_graph import KnowledgeGraph
+
+    kg = KnowledgeGraph()
+except Exception:
+    print("Warning: MemPalace knowledge graph could not start. Continuing without it.")
+
+def snake_predicate(text):
+    words = []
+    current = []
+    for ch in text.strip().lower():
+        if ch.isalnum():
+            current.append(ch)
+        elif current:
+            words.append("".join(current))
+            current = []
+    if current:
+        words.append("".join(current))
+    return "_".join(words)
+
+def fact_to_triple(fact):
+    """Ask Llama for one triple. Return None when the JSON is not one clear fact."""
+    result = client.chat.completions.create(
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Turn one fact into JSON with exactly three string keys: "
+                    "subject, predicate, object. "
+                    "If the fact is clearly about the user, set subject to user. "
+                    "Make predicate simple snake_case, like favorite_vehicle. "
+                    "Keep object short and literal. "
+                    "If you are not confident there is one clear triple, "
+                    'return {"subject":"","predicate":"","object":""}. '
+                    "Reply with JSON only. "
+                    'Example: "my favorite vehicle is a CyberTruck" -> '
+                    '{"subject":"user","predicate":"favorite_vehicle","object":"CyberTruck"}'
+                ),
+            },
+            {"role": "user", "content": fact},
+        ],
+        model="llama3.2:3b",
+    )
+    raw = result.choices[0].message.content or ""
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    data = json.loads(raw[start:end + 1])
+    if not isinstance(data, dict):
+        return None
+    subject = data.get("subject")
+    predicate = data.get("predicate")
+    obj = data.get("object")
+    if not all(isinstance(value, str) and value.strip() for value in (subject, predicate, obj)):
+        return None
+    subject = subject.strip()
+    if subject.lower() in {"i", "me", "my", "myself"}:
+        subject = "user"
+    predicate = snake_predicate(predicate)
+    obj = obj.strip()
+    if not subject or not predicate or not obj:
+        return None
+    return subject, predicate, obj
+
 while True:
     user_prompt = input("You: ")
 
@@ -62,7 +132,12 @@ while True:
                 room="facts",
                 n_results=3,
             )
-            facts = [hit["text"] for hit in found.get("results", []) if hit.get("text")]
+            for hit in found.get("results", []):
+                similarity = hit.get("similarity", 0)
+                accepted = similarity >= MIN_FACT_SIMILARITY and bool(hit.get("text"))
+                print(f"[debug] fact similarity {similarity}: {'accepted' if accepted else 'rejected'}")  # remove after testing
+                if accepted:
+                    facts.append(hit["text"])
         except Exception:
             facts = []
 
@@ -134,5 +209,13 @@ while True:
                     print("Warning: could not save this fact to MemPalace.")
             except Exception:
                 print("Warning: could not save this fact to MemPalace.")
+            if kg is not None:
+                try:
+                    triple = fact_to_triple(fact)
+                    if triple:
+                        kg.add_triple(triple[0], triple[1], triple[2], source_file="tinytalk")
+                        print(f"[debug] KG: {triple[0]} -> {triple[1]} -> {triple[2]}")
+                except Exception:
+                    pass
     print(f"Llama: {response}")
     print("-" * 30)
