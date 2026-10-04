@@ -32,7 +32,7 @@ Just me poking at the machinery.
 
 ## What it does right now
 
-TinyTalk currently runs `llama3.2:3b` locally through Ollama.
+TinyTalk can answer with `llama3.2:3b` locally through Ollama, or with Grok through the xAI API. The choice is configuration. Soul, short-term history, and MemPalace stay the same either way.
 
 On top of that, I've slowly added a few different kinds of continuity.
 
@@ -152,6 +152,12 @@ isn't particularly similar to any one fact.
 
 So TinyTalk now recognizes a few broad memory questions and directly reads the current fact list instead of trying to similarity-search it.
 
+That list is only the saved facts retrieved for that request. The instruction says so. It also says the list is not a complete inventory of stored conversations, that other memories may exist even when they were not included, and that these facts are saved memories rather than something the model learned in training. The same limits are attached when a similar fact or an old conversation excerpt is included.
+
+Each included record is labelled as a saved fact, a conversation excerpt, an archived fact, or a knowledge-graph record. The original text stays as it was stored. An id or a timestamp is shown only when the record already has one. A filing time or a graph time is not a date the real-world fact changed.
+
+TinyTalk does not print those labels after every answer. `/sources` prints the records included with the last successful answer: the type, any stored id, and a short preview. It shows the sources supplied with that answer. It does not prove which sources the model used. If none were included, it says that, without claiming that no memories exist or that the answer came only from model knowledge. `/sources` does not call the model or save a memory. A failed reply leaves the previous list in place. `/speak` and `/stop` leave it in place too. The list lasts for this terminal session only.
+
 That sounds obvious in hindsight.
 
 It was not obvious before I watched it fail. 😂
@@ -239,17 +245,13 @@ another:
 spaceship_name
 ```
 
-and another:
-
-```text
-imaginary_spaceship_name
-```
-
-So TinyTalk now normalizes those into a canonical relationship:
+Those two are the same idea, so TinyTalk normalizes them to:
 
 ```text
 test_spaceship_name
 ```
+
+`imaginary_spaceship_name` stays its own relationship. An imaginary spaceship does not replace the test spaceship just because the names look related.
 
 That was one of those moments where the model wasn't exactly *wrong*.
 
@@ -257,7 +259,18 @@ The software just needed to stop assuming the model would describe the same idea
 
 The knowledge graph currently helps manage structured facts and supersession.
 
-TinyTalk does **not** yet use the graph as a general answer source.
+TinyTalk does **not** use the graph as a general answer source. A few exact questions are the exception. TinyTalk recognizes these wordings, ignoring capitalization, extra spaces, a trailing question mark, and straight or curly apostrophes:
+
+```text
+What was my test spaceship called before Enterprise?
+What did I call my test spaceship before Enterprise?
+What was the previous name of my test spaceship?
+What was my test spaceship's previous name?
+What was the old name of my test spaceship?
+What was my test spaceship named previously?
+```
+
+For those, it reads the current and inactive `test_spaceship_name` edges and the `tinytalk/facts` and `tinytalk/facts-history` rooms. Stored predicates pass through the same aliases as new facts. The labels name the current value and, when the records support one, the previous name. An inactive edge that repeats the current name is not a previous name. An archived test-spaceship fact fills in when the graph has no different earlier name. A separate imaginary-spaceship fact is not part of this relationship. Filing times are used only when they put the earlier names in order, and TinyTalk does not turn them into a rename date. Search order is not time order. If the records do not establish one previous name, the label says that. These questions do not replace saved facts. Every other question still uses the normal fact search.
 
 ---
 
@@ -322,10 +335,26 @@ That's kind of the whole experiment.
 You'll need:
 
 - Python 3
-- Ollama
-- Llama 3.2 3B
 - MemPalace 3.10+
 - the packages in `requirements.txt`
+
+Ollama mode also needs Ollama and Llama 3.2 3B. Grok mode needs an xAI API key instead. It does not need Ollama for generation.
+
+Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+Copy the example environment file and edit it locally. `.env` is gitignored. `.env.example` only has placeholders.
+
+```bash
+cp .env.example .env
+```
+
+TinyTalk reads `.env` on startup and does not override variables you already exported. You can also export the variables yourself and skip the file.
+
+## Ollama (the default)
 
 Pull the model:
 
@@ -333,11 +362,16 @@ Pull the model:
 ollama pull llama3.2:3b
 ```
 
-Install dependencies:
+`.env`:
 
-```bash
-pip install -r requirements.txt
+```text
+TINYTALK_PROVIDER=ollama
+OLLAMA_MODEL=llama3.2:3b
 ```
+
+`OLLAMA_MODEL` defaults to `llama3.2:3b` when it is unset. `OLLAMA_BASE_URL` defaults to `http://localhost:11434/v1`.
+
+`TINYTALK_DEBUG` defaults to off. Set it to `1`, `true`, `yes`, or `on` to print fact-similarity scores and knowledge-graph updates. Save warnings and API errors stay visible either way. The startup line still names the provider in use.
 
 Run it:
 
@@ -349,9 +383,93 @@ You'll get:
 
 ```text
 🤖 Hello! I'm your Llama assistant, running locally. (Type 'quit' to exit)
+Type /speak to hear the last answer, /stop to stop playback, or /sources to list memories included with the last answer.
 ------------------------------
 You:
 ```
+
+Leaving `TINYTALK_PROVIDER` unset does the same thing. Ollama mode does not read `XAI_API_KEY` and does not open a Grok client.
+
+## Grok
+
+Grok mode calls the xAI Responses API (`POST https://api.x.ai/v1/responses`) with the OpenAI Python SDK. That is the API xAI documents as the primary text interface. The verified model ID to put in `XAI_MODEL` is `grok-4.7`. That string is the API model ID from the Grok 4.7 docs. It is not a Grok Build label, and reasoning effort such as "medium" is not a model name. TinyTalk does not send a reasoning-effort override, so the model uses its own default.
+
+Create a key on the [xAI console API keys page](https://console.x.ai/team/default/api-keys). Billing for that key is separate from anything Ollama does on your machine. xAI charges per token. Check the current prices in the [xAI models docs](https://docs.x.ai/developers/models) before you leave it running.
+
+`.env`:
+
+```text
+TINYTALK_PROVIDER=grok
+XAI_API_KEY=
+XAI_MODEL=grok-4.7
+```
+
+Put the real key only in `.env` or in your shell. Do not commit it, paste it into the README, or put it in browser code. This project has no browser app.
+
+Or, without a file:
+
+```bash
+TINYTALK_PROVIDER=grok XAI_API_KEY="your-key" XAI_MODEL="grok-4.7" python3 tinytalk.py
+```
+
+You'll get:
+
+```text
+🤖 Hello! I'm TinyTalk, using Grok through the xAI API. (Type 'quit' to exit)
+Type /speak to hear the last answer, /stop to stop playback, or /sources to list memories included with the last answer.
+------------------------------
+You:
+```
+
+What gets sent: each reply includes `SOUL.md`, any memory context TinyTalk decided to inject for that turn, and the trimmed recent conversation (`MAX_TURNS = 10`). What stays local: MemPalace drawers, the knowledge graph, and embeddings. Embeddings are MemPalace's local MiniLM or EmbeddingGemma model, not Ollama and not xAI.
+
+TinyTalk keeps the transcript itself. Requests set `store` to false and do not send `previous_response_id`, so a Grok conversation is not continued from xAI's stored response history. Each request is plain text generation. It does not send `tools`, `tool_choice`, or `search_parameters`. Setting `tool_choice` without tools returns HTTP 400, and `search_parameters` is the deprecated live-search field that returns HTTP 410. TinyTalk does not enable web search or X search. A failed or empty model response is printed and is not saved as an assistant turn. TinyTalk will not silently switch back to Ollama if Grok fails.
+
+Each request uses a 10 second connect timeout and a 120 second read timeout. The OpenAI SDK's own retries are turned off (`max_retries=0`). TinyTalk retries a connection failure, timeout, rate limit, or server error itself, for three attempts total, with a short backoff. The same limit applies to Ollama.
+
+## Spoken answers
+
+Spoken output is optional. Typed chat works the same way if VoiceStudio is not running.
+
+TinyTalk does not start VoiceStudio. Start that backend yourself and leave it on `http://127.0.0.1:3900`. The saved voice is the design profile `TinyTalk — Curious Little Computer` (`5e49413d`, engine `omnivoice`, seed 42). `/speak` sends that profile id. It does not send the voice name `default`.
+
+`.env` (both optional; these are the defaults):
+
+```text
+VOICESTUDIO_BASE_URL=http://127.0.0.1:3900
+VOICESTUDIO_VOICE_ID=5e49413d
+```
+
+Then:
+
+```bash
+python3 tinytalk.py
+```
+
+After a successful assistant reply:
+
+- `/speak` speaks that reply. TinyTalk prints `Speaking the last answer…` and generates the audio in the background, so you can keep typing. When the clip is ready it plays through macOS `afplay`.
+- A second `/speak` while a clip is already being made or played does not start another one.
+- `/stop` stops playback. If generation is still in flight, TinyTalk discards the audio when it arrives and does not play it. VoiceStudio may still finish that request on the server; stopping playback does not cancel it.
+- `quit` also stops playback.
+
+`/speak` and `/stop` do not call Grok or Ollama, do not add a conversation turn, and do not save a memory. They speak only the last assistant message shown in the chat. The separate fact-extraction request is not spoken. They also leave the `/sources` list unchanged.
+
+The speech client is separate from the chat client. It allows 10 seconds to connect and 300 seconds for the whole request, and it does not retry. It does not send `XAI_API_KEY`. If VoiceStudio is down, times out, or returns an error, TinyTalk prints that and leaves text chat usable. The first clip after a cold model load can take several minutes. Later clips are faster while the model stays loaded.
+
+## Troubleshooting
+
+Configuration errors stop startup. They look like `Configuration error: ...`.
+
+- `TINYTALK_PROVIDER must be 'ollama' or 'grok'` — the variable is set to something else.
+- `Grok mode needs XAI_API_KEY` or `XAI_MODEL` — Grok was selected and one of those is missing. Ollama is not used as a fallback.
+- HTTP 401 — xAI rejected the key. Create or copy a key from the console. TinyTalk never prints the key.
+- HTTP 403 — the key or team is not allowed to call that model.
+- HTTP 404 — `XAI_MODEL` is not a model ID this team can use. `grok-4.7` is the verified ID.
+- HTTP 429 — the team rate limit was hit after the retries. Wait and try again. Limits are per model in the xAI console.
+- Could not reach the xAI API — DNS, network, or a timeout. The request was not retried forever.
+- Could not reach Ollama — start Ollama and confirm `ollama pull llama3.2:3b` has finished. Generation in Grok mode does not need this. Saving and searching memory does not either, unless MemPalace itself has not finished downloading its local embedding model.
+- Empty response — the model returned no assistant text, or a response that was not `completed`. Nothing from that turn is written to history or MemPalace.
 
 And that's TinyTalk.
 
@@ -368,10 +486,9 @@ A few of the interesting ones:
 - Llama 3.2 3B is fast and tiny, but sometimes gets weird with structured output or explanations.
 - Predicate normalization only covers relationships I've explicitly accounted for.
 - Only some facts are currently treated as single-value facts.
-- Some of my old test memories still need a one-time cleanup.
 - Conversation retrieval and explicit-fact retrieval still take separate paths.
 - TinyTalk occasionally exposes too much of its internal prompt plumbing when talking about its memories.
-- The knowledge graph isn't queried during normal conversation yet.
+- The knowledge graph isn't queried during normal conversation. Previous-name questions about the test spaceship are the exception.
 - There is no live web research system.
 - Memory storage and graph updates aren't transactional.
 
@@ -387,34 +504,39 @@ This isn't meant to be a rigid product roadmap.
 
 It's more of a **things I want to poke at next** list.
 
-## Next
+## Done
 
-- [ ] Clean up the old Picklewagon -> Serenity -> Enterprise test-memory chain
-- [ ] Verify current vs. historical facts end-to-end
-- [ ] Improve memory provenance so TinyTalk knows whether something came from:
-  - an explicit fact
-  - an old conversation
-  - recent context
-  - its base model knowledge
-- [ ] Stop TinyTalk from saying things like "I was trained on this" when it actually retrieved something from memory
-- [ ] Gate or remove the temporary debug output once the memory system settles down
+- [x] Ollama and Grok share one chat loop. Ollama is the default. Grok is optional, and TinyTalk does not silently fall back if Grok fails.
+- [x] Memories persist in MemPalace. Recall works, and replacing a single-value fact keeps the old value. That path is verified.
+- [x] The old test-spaceship chain is cleaned up. Enterprise is current, Serenity is archived, and Picklewagon stays a separate imaginary-spaceship fact.
+- [x] Memory answers say what was retrieved and what was not. `TINYTALK_DEBUG` is optional and off by default.
+- [x] `/speak` and `/stop` use the local VoiceStudio profile. Live playback is verified.
+- [x] The previous-name questions below return Serenity. Asking what the test spaceship is called now still returns Enterprise.
+- [x] `imaginary_spaceship_name` stays its own predicate. It no longer replaces `test_spaceship_name`.
+- [x] Retrieved facts, conversations, archived facts, and graph records carry source labels and any metadata already stored. `/sources` lists the records included with the last successful answer. It makes no model call and saves no memory. Record dates are not presented as real-world change dates. The list shows supplied sources; it does not prove which sources the model used. Live Grok checks passed: Enterprise is current, Serenity is the previous test-spaceship name, and Picklewagon is excluded from that historical context.
 
-## After that
-
-- [ ] Let the knowledge graph answer historical questions
-
-Example:
+Only these wordings count as that history. "My spaceship" without "test" does not:
 
 ```text
-What was my spaceship called before Enterprise?
+What was my test spaceship called before Enterprise?
+What did I call my test spaceship before Enterprise?
+What was the previous name of my test spaceship?
+What was my test spaceship's previous name?
+What was the old name of my test spaceship?
+What was my test spaceship named previously?
 ```
 
-- [ ] Improve coordination between:
-  - explicit facts
-  - conversation memory
-  - graph knowledge
+Anything else is an ordinary question. This is not a general historical memory, and it is not a timeline.
 
-- [ ] Make the model/provider swappable
+## Next
+
+- [ ] Broader history questions, and other facts that change over time.
+- [ ] Stronger memory provenance than the `/sources` list, and tighter coordination between explicit facts, older conversations, and the graph.
+- [ ] Compare models on the same Soul and memories, then add more providers the same way.
+- [ ] Speech speed, streaming, and eventually voice input.
+- [ ] Version `SOUL.md`. If TinyTalk ever proposes a change to its Soul, I have to approve it first.
+
+Ollama and Grok already share the loop. TinyTalk still owns `SOUL.md`, the last 10 turns, and MemPalace. The model is only the part that writes the next reply.
 
 I'd like TinyTalk itself to eventually be:
 
@@ -435,6 +557,26 @@ Maybe something that doesn't exist yet.
 The model shouldn't have to **be** TinyTalk.
 
 It should just be one of the brains TinyTalk can use.
+
+If Llama, Qwen, and Gemini all get:
+
+```text
+SOUL.md
++
+the same memories
++
+the same recent conversation
+```
+
+and I ask:
+
+```text
+Who are you?
+```
+
+how much of "TinyTalk" survives the model swap?
+
+I want to find out.
 
 ## Research mode
 
@@ -465,40 +607,6 @@ claim -> source relationships
 I'm putting this on hold until I find a cloud/search path I actually like that can stay at $0.
 
 I don't want to bolt something onto the project just because I can.
-
-## Further out
-
-A few things I'm curious about:
-
-- [ ] letting TinyTalk propose changes to its own Soul
-- [ ] requiring human approval before any Soul change
-- [ ] versioning `SOUL.md`
-- [ ] stronger source/provenance tracking for memories
-- [ ] research recall and freshness
-- [ ] better temporal knowledge
-- [ ] seeing how different models behave when given the exact same Soul and memory
-
-That last one is especially interesting to me.
-
-If Llama, Qwen, and Gemini all get:
-
-```text
-SOUL.md
-+
-the same memories
-+
-the same recent conversation
-```
-
-and I ask:
-
-```text
-Who are you?
-```
-
-how much of "TinyTalk" survives the model swap?
-
-I want to find out.
 
 ---
 
