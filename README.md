@@ -211,6 +211,39 @@ The goal isn't to erase the past.
 
 It's to stop confusing **what used to be true** with **what TinyTalk currently believes is true**.
 
+The graph edge for a single-value fact records which saved fact it came from, so replacing a value archives exactly that one fact. Other facts that happen to contain the same word stay where they are.
+
+Edges saved before TinyTalk recorded that link have no such proof, and TinyTalk doesn't guess. It doesn't search for the old word or ask the model to re-read old facts. The one exception is `test_spaceship_name`: TinyTalk replaces it only when exactly one current fact parses as a test-spaceship name with the same value as the graph. That parse uses the same rule as the history questions. Any other unlinked value, such as a graph that says `New York City` next to a fact that says `I live in NYC.`, is left alone. The new words are kept as an unfinished update, and TinyTalk says so. No command moves the old records today.
+
+A replacement runs in this order:
+
+1. Save the new words in `facts-pending`.
+2. Archive the old fact to `facts-history`.
+3. Supersede the value in the graph.
+4. Move the new fact into `facts`.
+5. Move earlier unfinished updates for the same relationship to `facts-abandoned`.
+
+Those are separate MemPalace writes, not one transaction. TinyTalk stops at the first one that fails. Until step 4 is done, the new words stay in `facts-pending`. Ordinary recall, the fact list, and the test-spaceship history questions label them as an unfinished update rather than a current fact. Where the graph shows the last finished value, they say that value is still current. Otherwise they say the current value isn't settled. A stored `Remember this:` turn for an unfinished update is left out of the retrieved conversation excerpts.
+
+Repeating the same `Remember this:` line carries on from the step that failed, without adding duplicate facts. A different value for the same relationship replaces the last finished value and moves the earlier unfinished attempt to `facts-abandoned`, where it stays visible but is never current. Repeating that abandoned line later is treated as a new replacement.
+
+If no clear fact can be extracted, only the words are saved, as before. They go into `facts`, and nothing in the graph changes or is replaced.
+
+After the reply to a `Remember this:` line, TinyTalk prints one `Memory:` line. The reply was written before anything was stored, so that line is the one to trust:
+
+```text
+Memory: saved.
+Memory: saved. Replaced Serenity.
+Memory: already saved.
+Memory: saved as written. No clear fact could be extracted, ...
+Memory: saved as written, but not as a current fact. ...
+Memory: saved, but the unfinished update to Enterprise could not be cleared. ...
+Memory: not saved. Saved memory is unavailable in this session.
+Memory: not saved. MemPalace could not store this fact.
+```
+
+The rest of each line says what didn't finish and whether repeating the command will finish it.
+
 ---
 
 ## Knowledge graph
@@ -507,7 +540,7 @@ It's more of a **things I want to poke at next** list.
 ## Done
 
 - [x] Ollama and Grok share one chat loop. Ollama is the default. Grok is optional, and TinyTalk does not silently fall back if Grok fails.
-- [x] Memories persist in MemPalace. Recall works, and replacing a single-value fact keeps the old value. That path is verified.
+- [x] Memories persist in MemPalace. Recall works, and replacing a single-value fact keeps the old value in `facts-history`. Tests against temporary MemPalace stores cover the normal path and these failures: a failed save, a failed graph read or update, failed archiving, a failed move into current facts, a different value after an unfinished update, and retries. Each test checks what later recall is given. A live session with the real palace has not re-checked this since the change.
 - [x] The old test-spaceship chain is cleaned up. Enterprise is current, Serenity is archived, and Picklewagon stays a separate imaginary-spaceship fact.
 - [x] Memory answers say what was retrieved and what was not. `TINYTALK_DEBUG` is optional and off by default.
 - [x] `/speak` and `/stop` use the local VoiceStudio profile. Live playback is verified.
