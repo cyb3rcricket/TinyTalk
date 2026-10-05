@@ -1,18 +1,20 @@
 """Memory behavior against a temporary palace.
 
-This must not open the default MemPalace directory or knowledge graph.
+memory_isolation keeps every MemPalace path inside a temporary root and
+refuses to open a store anywhere else.
 """
 
 import io
 import os
 import sys
-import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import memory_isolation  # noqa: E402  (must come before tinytalk and mempalace)
 import tinytalk
 from provider import ProviderError
 
@@ -33,15 +35,6 @@ class ScriptedProvider(object):
         return reply
 
 
-def _stamp(path):
-    target = Path(path)
-    if not target.exists():
-        return "missing"
-    stat = target.stat()
-    kind = "dir" if target.is_dir() else stat.st_size
-    return (stat.st_mtime_ns, kind)
-
-
 def _triple(obj):
     return (
         '{"subject":"user","predicate":"test_spaceship","object":"%s"}' % obj
@@ -50,19 +43,10 @@ def _triple(obj):
 
 class IsolatedMemoryTests(unittest.TestCase):
     def test_recall_replacement_and_graph_use_a_temporary_store(self):
-        from mempalace.config import MempalaceConfig
-        from mempalace.knowledge_graph import DEFAULT_KG_PATH
-
-        default_palace = MempalaceConfig().palace_path
-        before = {
-            "palace": _stamp(default_palace),
-            "kg": _stamp(DEFAULT_KG_PATH),
-        }
-
-        with tempfile.TemporaryDirectory(prefix="tinytalk-memory-") as temp:
+        with memory_isolation.temp_dir("tinytalk-memory-") as temp:
             palace_path = os.path.join(temp, "palace")
             kg_path = os.path.join(temp, "knowledge_graph.sqlite3")
-            memory = tinytalk.open_memory(palace_path=palace_path, kg_path=kg_path)
+            memory = memory_isolation.open_isolated_memory(temp)
             self.assertIsNotNone(memory.palace)
             self.assertIsNotNone(memory.kg)
             self.assertEqual(os.path.abspath(memory.palace_path), os.path.abspath(palace_path))
@@ -148,17 +132,10 @@ class IsolatedMemoryTests(unittest.TestCase):
             self.assertTrue(any("Serenity." in text for text in stored))
 
             self.assertTrue(provider.calls)
-            self.assertNotIn(DEFAULT_KG_PATH, memory.kg.db_path)
-
-        self.assertEqual(_stamp(default_palace), before["palace"])
-        self.assertEqual(_stamp(DEFAULT_KG_PATH), before["kg"])
 
     def test_graph_extraction_failure_still_saves_the_verbatim_fact(self):
-        with tempfile.TemporaryDirectory(prefix="tinytalk-memory-") as temp:
-            memory = tinytalk.open_memory(
-                palace_path=os.path.join(temp, "palace"),
-                kg_path=os.path.join(temp, "knowledge_graph.sqlite3"),
-            )
+        with memory_isolation.temp_dir("tinytalk-memory-") as temp:
+            memory = memory_isolation.open_isolated_memory(temp)
             provider = ScriptedProvider([
                 "Saved the words.",
                 ProviderError("xAI returned an empty response."),
@@ -175,14 +152,6 @@ class IsolatedMemoryTests(unittest.TestCase):
             self.assertEqual(memory.current_fact_objects("user", "favorite_vehicle"), [])
 
     def test_imaginary_spaceship_name_does_not_replace_the_test_spaceship(self):
-        from mempalace.config import MempalaceConfig
-        from mempalace.knowledge_graph import DEFAULT_KG_PATH
-
-        default_palace = MempalaceConfig().palace_path
-        before = {
-            "palace": _stamp(default_palace),
-            "kg": _stamp(DEFAULT_KG_PATH),
-        }
         imaginary = ScriptedProvider([
             '{"subject":"user","predicate":"imaginary_spaceship_name","object":"Picklewagon"}'
         ])
@@ -204,11 +173,8 @@ class IsolatedMemoryTests(unittest.TestCase):
             self.assertEqual(normalized, ("user", "test_spaceship_name", "Enterprise"))
             self.assertEqual(tinytalk._canon_predicate(alias), "test_spaceship_name")
 
-        with tempfile.TemporaryDirectory(prefix="tinytalk-alias-") as temp:
-            memory = tinytalk.open_memory(
-                palace_path=os.path.join(temp, "palace"),
-                kg_path=os.path.join(temp, "knowledge_graph.sqlite3"),
-            )
+        with memory_isolation.temp_dir("tinytalk-alias-") as temp:
+            memory = memory_isolation.open_isolated_memory(temp)
             provider = ScriptedProvider([
                 "I'll remember Enterprise.",
                 '{"subject":"user","predicate":"test_spaceship","object":"Enterprise"}',
@@ -277,10 +243,6 @@ class IsolatedMemoryTests(unittest.TestCase):
             self.assertTrue(any("Serenity" in fact for fact in facts))
             self.assertTrue(any("Picklewagon" in fact for fact in facts))
             self.assertFalse(any("Enterprise" in fact for fact in facts))
-            self.assertNotIn(DEFAULT_KG_PATH, memory.kg.db_path)
-
-        self.assertEqual(_stamp(default_palace), before["palace"])
-        self.assertEqual(_stamp(DEFAULT_KG_PATH), before["kg"])
 
 
 def _fact_drawer(room, text, filed_at=None):
@@ -543,23 +505,12 @@ class TestSpaceshipHistoryTests(unittest.TestCase):
         self.assertNotIn("saved facts retrieved for this request", messages[0]["content"])
 
     def test_palace_history_answers_without_rewriting_facts(self):
-        from mempalace.config import MempalaceConfig
-        from mempalace.knowledge_graph import DEFAULT_KG_PATH
-
-        default_palace = MempalaceConfig().palace_path
-        before = {
-            "palace": _stamp(default_palace),
-            "kg": _stamp(DEFAULT_KG_PATH),
-        }
         questions = (
             "What was my test spaceship called before Enterprise?",
             "What was the previous name of my test spaceship?",
         )
-        with tempfile.TemporaryDirectory(prefix="tinytalk-history-") as temp:
-            memory = tinytalk.open_memory(
-                palace_path=os.path.join(temp, "palace"),
-                kg_path=os.path.join(temp, "knowledge_graph.sqlite3"),
-            )
+        with memory_isolation.temp_dir("tinytalk-history-") as temp:
+            memory = memory_isolation.open_isolated_memory(temp)
             saved = memory.add_drawer(
                 wing="tinytalk",
                 room="facts",
@@ -622,10 +573,6 @@ class TestSpaceshipHistoryTests(unittest.TestCase):
             ordinary = provider.calls[-1][1]["content"]
             self.assertIn("saved facts retrieved for this request", ordinary)
             self.assertNotIn("Previous name:", ordinary)
-            self.assertNotIn(DEFAULT_KG_PATH, memory.kg.db_path)
-
-        self.assertEqual(_stamp(default_palace), before["palace"])
-        self.assertEqual(_stamp(DEFAULT_KG_PATH), before["kg"])
 
 
 def _record_snapshot(memory):
