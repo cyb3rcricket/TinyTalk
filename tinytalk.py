@@ -4,6 +4,7 @@ import re
 import sys
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import parse_qs, urlencode
 
 from provider import ConfigError, ProviderError, build_provider, load_settings
 from speech import Afplay, SpeechController, VoiceStudioSpeech, command_kind, speech_settings
@@ -37,6 +38,13 @@ SINGLE_VALUE_PREDICATES = {
     "home_city",
     "current_job",
 }
+
+# Current facts, replaced facts, facts whose update did not finish, and
+# unfinished updates that a later command for the same relationship replaced.
+FACT_ROOM = "facts"
+HISTORY_ROOM = "facts-history"
+PENDING_ROOM = "facts-pending"
+ABANDONED_ROOM = "facts-abandoned"
 
 PREDICATE_ALIASES = {
     "test_spaceship": "test_spaceship_name",
@@ -601,6 +609,60 @@ def _drawer_sources(memory, room, kind):
     return sources
 
 
+UNFINISHED_KIND = "unfinished memory update"
+
+
+def _unfinished_text(update):
+    lines = [
+        'Not a current fact: "%s"' % update.get("text"),
+        'This "Remember this:" update did not finish.',
+    ]
+    predicate = update.get("predicate")
+    if predicate in SINGLE_VALUE_PREDICATES:
+        if update.get("last_value"):
+            lines.append("The last completed %s is %s." % (predicate, update["last_value"]))
+        else:
+            lines.append(
+                "The saved records do not establish the current %s. "
+                "Do not state one as current." % predicate
+            )
+    return " ".join(lines)
+
+
+def unfinished_memory(memory):
+    """Sources for facts whose update did not finish, and the updates themselves.
+
+    A memory without unfinished_updates has none. If they cannot be read, one
+    source says so, because saved facts may then be out of date.
+    """
+    reader = getattr(memory, "unfinished_updates", None)
+    if reader is None:
+        return [], []
+    try:
+        updates = reader()
+    except Exception:
+        return [_source(
+            UNFINISHED_KIND,
+            "TinyTalk could not check for unfinished memory updates, "
+            "so saved facts may be out of date.",
+        )], []
+    sources = [
+        _source(UNFINISHED_KIND, _unfinished_text(update), update.get("drawer_id"),
+                filed_at=update.get("filed_at"))
+        for update in updates
+    ]
+    return sources, updates
+
+
+def _from_unfinished_command(item, updates):
+    """True for a stored turn that sent "Remember this:" for an unfinished update."""
+    text = item if isinstance(item, str) else (item.get("text") or item.get("content_preview") or "")
+    text = text.casefold()
+    return "remember this:" in text and any(
+        (update.get("text") or "").casefold() in text for update in updates if update.get("text")
+    )
+
+
 class SessionSources(object):
     """Sources included with the last successful answer. Session memory only."""
 
@@ -662,11 +724,37 @@ def _load_test_spaceship_records(memory):
     return graph_rows, drawers
 
 
+def _unsettled_row(row, names):
+    if not isinstance(row, dict) or _canon_predicate(row.get("predicate")) != "test_spaceship_name":
+        return False
+    if "current" in row and row.get("current") is not None:
+        current = bool(row.get("current"))
+    else:
+        current = not row.get("valid_to")
+    return current and any(_names_match(row.get("object"), name) for name in names)
+
+
 def historical_context_message(user_prompt, memory):
     later_name = test_spaceship_history_question(user_prompt)
     sources = []
+    unfinished, updates = unfinished_memory(memory)
+    # Only unfinished test-spaceship updates matter here. Their names are not current.
+    ship = []
+    for source, update in zip(unfinished, updates):
+        if update.get("predicate") == "test_spaceship_name":
+            name = update.get("object")
+        elif not update.get("predicate"):
+            name = test_spaceship_fact_name(update.get("text"))
+        else:
+            name = None
+        if name:
+            ship.append((source, name, update.get("last_value")))
+    if updates:
+        unfinished = [source for source, _name, _last in ship]
+    unsettled = [name for _source, name, last in ship if not _names_match(name, last)]
     try:
         graph_rows, drawers = _load_test_spaceship_records(memory)
+        graph_rows = [row for row in graph_rows if not _unsettled_row(row, unsettled)]
         evidence = test_spaceship_history_evidence(graph_rows, drawers, later_name)
         body = format_test_spaceship_history(evidence)
         sources = history_sources(evidence)
@@ -677,6 +765,11 @@ def historical_context_message(user_prompt, memory):
             "Do not guess a name or a date."
         )
         sources = []
+    if unfinished:
+        body = body + "\n" + "\n".join(
+            "Unfinished update, not the current name: %s" % source["text"] for source in unfinished
+        )
+        sources = sources + unfinished
     if sources:
         body = body + "\n\nRetrieved sources:\n\n" + render_sources(sources)
     message = {
@@ -757,13 +850,15 @@ class MemoryStore(object):
     does not call Ollama or xAI.
     """
 
-    def __init__(self, palace, palace_path, kg, add_drawer, list_drawers, update_drawer):
+    def __init__(self, palace, palace_path, kg, add_drawer, list_drawers, update_drawer,
+                 get_drawer=None):
         self.palace = palace
         self.palace_path = palace_path
         self.kg = kg
         self.add_drawer = add_drawer
         self.list_drawers = list_drawers
         self.update_drawer = update_drawer
+        self.get_drawer = get_drawer
 
     def search_facts(self, query):
         from mempalace.searcher import search_memories
@@ -825,23 +920,76 @@ class MemoryStore(object):
         )
 
     def current_fact_objects(self, subject, predicate):
-        rows = self.kg.query_entity(subject)
-        return [
-            row.get("object")
-            for row in rows
-            if row.get("current") and row.get("predicate") == predicate and row.get("object")
-        ]
+        return [link["object"] for link in self.current_links(subject, predicate)]
 
-    def archive_replaced_fact(self, old_obj):
-        if self.list_drawers is None or self.update_drawer is None or not old_obj:
-            return
-        listed = self.list_drawers(wing="tinytalk", room="facts", limit=100)
-        needle = old_obj.lower()
-        for item in listed.get("drawers", []):
-            text = (item.get("content_preview") or "").lower()
-            drawer_id = item.get("drawer_id")
-            if drawer_id and needle in text:
-                self.update_drawer(drawer_id, room="facts-history")
+    def current_links(self, subject, predicate):
+        """Current graph values for one relationship, each with its fact drawer id.
+
+        query_entity does not return source_drawer_id, so this pages the stored
+        rows with KnowledgeGraph.dump_rows. drawer_id is None for edges written
+        before TinyTalk recorded it. Raises if the graph cannot be read.
+        """
+        names = {row["id"]: row["name"] for row in _graph_rows(self.kg, "entities")}
+        links = []
+        for row in _graph_rows(self.kg, "triples"):
+            if row["valid_to"] is not None or row["predicate"] != predicate:
+                continue
+            if (names.get(row["subject"]) or "").casefold() != subject.casefold():
+                continue
+            obj = names.get(row["object"])
+            if obj:
+                links.append({"object": obj, "drawer_id": row.get("source_drawer_id")})
+        return links
+
+    def pending_facts(self):
+        """Facts whose "Remember this:" update did not finish. Raises if they cannot be listed."""
+        found = []
+        for drawer in _room_drawers(self, PENDING_ROOM):
+            predicate, obj = _fact_relationship(drawer["metadata"])
+            found.append({
+                "drawer_id": drawer["drawer_id"],
+                "text": drawer["text"],
+                "predicate": predicate,
+                "object": obj,
+                "filed_at": drawer["metadata"].get("filed_at"),
+            })
+        return found
+
+    def unfinished_updates(self):
+        """Pending facts, each with the last completed value of its relationship.
+
+        last_value is the one current graph value whose drawer is not itself
+        pending or abandoned. It is None when the graph does not establish one.
+        """
+        updates = self.pending_facts()
+        for update in updates:
+            update["last_value"] = None
+            if update["predicate"] not in SINGLE_VALUE_PREDICATES or self.kg is None:
+                continue
+            try:
+                values = []
+                for link in self.current_links("user", update["predicate"]):
+                    room = _drawer_room(self, link["drawer_id"]) if link["drawer_id"] else None
+                    if room in (PENDING_ROOM, ABANDONED_ROOM):
+                        continue
+                    if not any(_names_match(link["object"], value) for value in values):
+                        values.append(link["object"])
+            except Exception:
+                values = []
+            if len(values) == 1:
+                update["last_value"] = values[0]
+        return updates
+
+
+def _graph_rows(kg, table):
+    rows = []
+    after = 0
+    while True:
+        page = kg.dump_rows(table, after_rowid=after, limit=1000)
+        rows.extend(page)
+        if len(page) < 1000:
+            return rows
+        after = page[-1]["_rowid"]
 
 
 def _import_memory_tools():
@@ -891,6 +1039,7 @@ def open_memory(palace_path=None, kg_path=None):
     add_drawer = None
     list_drawers = None
     update_drawer = None
+    get_drawer = None
     try:
         mcp = _import_memory_tools()
         if palace_path and resolved:
@@ -898,10 +1047,12 @@ def open_memory(palace_path=None, kg_path=None):
         add_drawer = mcp.tool_add_drawer
         list_drawers = mcp.tool_list_drawers
         update_drawer = mcp.tool_update_drawer
+        get_drawer = mcp.tool_get_drawer
     except Exception:
         add_drawer = None
         list_drawers = None
         update_drawer = None
+        get_drawer = None
 
     kg = None
     try:
@@ -915,10 +1066,12 @@ def open_memory(palace_path=None, kg_path=None):
         print("Warning: MemPalace knowledge graph could not start. Continuing without it.")
         kg = None
 
-    return MemoryStore(palace, resolved, kg, add_drawer, list_drawers, update_drawer)
+    return MemoryStore(palace, resolved, kg, add_drawer, list_drawers, update_drawer, get_drawer)
 
 
 def _with_sources(lead, sources, messages):
+    if any(source["kind"] == UNFINISHED_KIND for source in sources):
+        lead = lead + " A record labeled unfinished memory update is not a current fact."
     return [
         {
             "role": "system",
@@ -934,6 +1087,7 @@ def build_context(user_prompt, messages, memory):
         return [message] + messages, sources
     if memory is None or memory.palace is None:
         return messages, []
+    unfinished, updates = unfinished_memory(memory)
     if is_memory_introspection(user_prompt):
         sources = []
         try:
@@ -946,10 +1100,10 @@ def build_context(user_prompt, messages, memory):
                 ]
         except Exception:
             sources = []
-        if sources:
+        if sources or unfinished:
             return _with_sources(
                 "This context contains the saved facts retrieved for this request.",
-                sources,
+                sources + unfinished,
                 messages,
             )
         return messages, []
@@ -960,7 +1114,7 @@ def build_context(user_prompt, messages, memory):
     except Exception:
         facts = []
     if facts:
-        sources = [_coerce_saved_fact(item) for item in facts if item]
+        sources = [_coerce_saved_fact(item) for item in facts if item] + unfinished
         return _with_sources(
             "This context contains the saved facts retrieved for this request.",
             sources,
@@ -972,8 +1126,11 @@ def build_context(user_prompt, messages, memory):
         found = memory.search_conversations(user_prompt)
     except Exception:
         found = []
+    # A stored "Remember this:" turn for an unfinished update would repeat
+    # that update as if it were settled. The unfinished record stands in for it.
+    found = [item for item in found if item and not _from_unfinished_command(item, updates)]
     if found:
-        sources = [_coerce_conversation(item) for item in found if item]
+        sources = [_coerce_conversation(item) for item in found] + unfinished
         return _with_sources(
             "This context contains excerpts retrieved for this request "
             "from earlier conversations. "
@@ -981,6 +1138,12 @@ def build_context(user_prompt, messages, memory):
             "When memories conflict, prefer explicit factual statements "
             "made by the user over previous assistant responses.",
             sources,
+            messages,
+        )
+    if unfinished:
+        return _with_sources(
+            "This context lists saved memory updates that did not finish.",
+            unfinished,
             messages,
         )
     return messages, []
@@ -992,88 +1155,326 @@ def context_messages(user_prompt, messages, memory):
     return request_messages
 
 
+class UnsafeReplacement(Exception):
+    """The saved records do not show which fact drawer holds the old value."""
+
+
+def _status(status, message):
+    return {"status": status, "message": message}
+
+
+def _not_saved(reason):
+    return _status("not_saved", "Memory: not saved. %s" % reason)
+
+
+def _pending(detail):
+    return _status(
+        "incomplete",
+        "Memory: saved as written, but not as a current fact. %s." % detail,
+    )
+
+
+def _fact_source_file(predicate=None, obj=None):
+    """Drawer metadata naming the single-value relationship a fact updates."""
+    if not predicate:
+        return "tinytalk"
+    return "tinytalk?" + urlencode({"predicate": predicate, "object": obj})
+
+
+def _fact_relationship(metadata):
+    source = (metadata or {}).get("source_file") or ""
+    if not source.startswith("tinytalk?"):
+        return None, None
+    fields = parse_qs(source[len("tinytalk?"):])
+    return (fields.get("predicate") or [None])[0], (fields.get("object") or [None])[0]
+
+
+def _drawer_room(memory, drawer_id):
+    """Room of one drawer, or None if it does not exist. Raises if it cannot be read."""
+    found = memory.get_drawer(drawer_id)
+    error = found.get("error") if isinstance(found, dict) else "no result"
+    if error:
+        if str(error).startswith("Drawer not found"):
+            return None
+        raise RuntimeError(error)
+    return found.get("room")
+
+
+def _move_drawer(memory, drawer_id, room):
+    try:
+        moved = memory.update_drawer(drawer_id, room=room)
+    except Exception:
+        return False
+    return isinstance(moved, dict) and bool(moved.get("success"))
+
+
+def _room_drawers(memory, room):
+    """Every tinytalk drawer in one room, with full text. Raises if the list cannot be read."""
+    drawers = []
+    offset = 0
+    while True:
+        page = memory.list_drawers(wing="tinytalk", room=room, limit=100, offset=offset)
+        if not isinstance(page, dict) or "drawers" not in page:
+            raise RuntimeError("could not list %s" % room)
+        for item in page["drawers"]:
+            text = item.get("content_preview") or ""
+            # MemPalace cuts previews at 200 characters and adds "...".
+            if len(text) > 200 and text.endswith("..."):
+                full = memory.get_drawer(item["drawer_id"])
+                if not isinstance(full, dict) or full.get("error"):
+                    raise RuntimeError("could not read drawer %s" % item["drawer_id"])
+                text = full.get("content") or ""
+            drawers.append({
+                "drawer_id": item.get("drawer_id"),
+                "text": text.strip(),
+                "metadata": item.get("metadata") or {},
+            })
+        offset += len(page["drawers"])
+        if not page["drawers"] or offset >= page.get("total", 0):
+            return drawers
+
+
+def _store_drawer(memory, fact, predicate=None, obj=None, room=PENDING_ROOM):
+    """Save the verbatim fact in room (facts-pending), unless the same text is already current.
+
+    Returns (drawer_id, room), or None if it could not be saved. The same text
+    found in facts-history or facts-abandoned moves to room, so a restated
+    value goes through the whole update again.
+    """
+    target = room
+    try:
+        if getattr(memory, "list_drawers", None) is not None:
+            for drawer in _room_drawers(memory, FACT_ROOM):
+                if drawer["text"] == fact:
+                    return drawer["drawer_id"], FACT_ROOM
+        saved = memory.add_drawer(
+            wing="tinytalk",
+            room=target,
+            content=fact,
+            source_file=_fact_source_file(predicate, obj),
+            added_by="tinytalk",
+        )
+    except Exception:
+        return None
+    if not isinstance(saved, dict) or not saved.get("success"):
+        return None
+    drawer_id = saved.get("drawer_id")
+    if saved.get("reason") != "already_exists" or getattr(memory, "get_drawer", None) is None:
+        return drawer_id, target
+    try:
+        room = _drawer_room(memory, drawer_id)
+    except Exception:
+        return None
+    if room in (FACT_ROOM, target):
+        return drawer_id, room
+    if room is not None and _move_drawer(memory, drawer_id, target):
+        return drawer_id, target
+    return None
+
+
+def _save_as_written(memory, fact, detail):
+    """No relationship was identified, so the words alone are the whole update."""
+    stored = _store_drawer(memory, fact, room=FACT_ROOM)
+    if stored is None:
+        return _not_saved("MemPalace could not store this fact.")
+    return _status("saved_as_written", "Memory: saved as written. %s." % detail)
+
+
+def _save_unfinished(memory, fact, detail, predicate=None, obj=None):
+    """Keep the words outside current facts when the update cannot finish."""
+    stored = _store_drawer(memory, fact, predicate, obj)
+    if stored is None:
+        return _not_saved("MemPalace could not store this fact.")
+    if stored[1] == FACT_ROOM:
+        return _status(
+            "incomplete",
+            "Memory: already saved as written, but the update could not be checked. %s."
+            % detail,
+        )
+    return _pending(detail)
+
+
+def _finish(memory, drawer_id, room, stale):
+    """Make the new drawer current, then retire earlier unfinished updates."""
+    if room != FACT_ROOM and not _move_drawer(memory, drawer_id, FACT_ROOM):
+        return _pending("The fact could not be moved into current facts. Repeat the command to finish")
+    left = [
+        update.get("object") or "an earlier value"
+        for update in stale
+        if update["drawer_id"] != drawer_id
+        and not _move_drawer(memory, update["drawer_id"], ABANDONED_ROOM)
+    ]
+    if left:
+        return _status(
+            "incomplete",
+            "Memory: saved, but the unfinished update to %s could not be cleared. "
+            "Repeat the command to finish." % ", ".join(left),
+        )
+    return None
+
+
+def _old_fact_drawer(memory, fact, predicate, link):
+    """(drawer_id, room to move it to) for one replaced value, or None.
+
+    A graph edge names its drawer, so that exact drawer moves. An edge saved
+    before TinyTalk recorded the link is accepted only for test_spaceship_name,
+    and only when exactly one current fact parses as a test-spaceship name and
+    that name is the graph value. Anything else raises UnsafeReplacement.
+    """
+    old = link["object"]
+    if link.get("drawer_id"):
+        try:
+            room = _drawer_room(memory, link["drawer_id"])
+        except Exception:
+            raise UnsafeReplacement("The saved fact for %s could not be read" % old)
+        if room == FACT_ROOM:
+            return link["drawer_id"], HISTORY_ROOM
+        if room == PENDING_ROOM:
+            return link["drawer_id"], ABANDONED_ROOM
+        return None
+    if predicate == "test_spaceship_name":
+        try:
+            drawers = _room_drawers(memory, FACT_ROOM)
+        except Exception:
+            raise UnsafeReplacement("The saved facts could not be read, so %s was not replaced" % old)
+        named = [d for d in drawers if d["text"] != fact and test_spaceship_fact_name(d["text"])]
+        if len(named) == 1 and _names_match(test_spaceship_fact_name(named[0]["text"]), old):
+            return named[0]["drawer_id"], HISTORY_ROOM
+    raise UnsafeReplacement(
+        "The saved value %s is not linked to one saved fact, so it was not replaced" % old
+    )
+
+
+def _save_additive(memory, fact, triple):
+    stored = _store_drawer(memory, fact)
+    if stored is None:
+        return _not_saved("MemPalace could not store this fact.")
+    drawer_id, room = stored
+    try:
+        memory.kg.add_triple(
+            triple[0], triple[1], triple[2], source_file="tinytalk", source_drawer_id=drawer_id
+        )
+    except Exception:
+        return _pending("The knowledge graph update failed. Repeat the command to finish")
+    debug("[debug] KG: %s -> %s -> %s" % triple)
+    finished = _finish(memory, drawer_id, room, [])
+    if finished:
+        return finished
+    if room == FACT_ROOM:
+        return _status("already_saved", "Memory: already saved.")
+    return _status("saved", "Memory: saved.")
+
+
+def _save_single_value(memory, fact, triple):
+    """Replace one single-value fact.
+
+    Order: read the graph and earlier unfinished updates, decide which drawers
+    to move, save the new drawer in facts-pending, archive the old drawer,
+    supersede in the graph, move the new drawer into facts, then move earlier
+    unfinished updates to facts-abandoned. Each step runs only if the one
+    before it worked. Until the last steps finish, the new words stay in
+    facts-pending, outside current facts. Repeating the command continues.
+    """
+    subject, predicate, obj = triple
+    try:
+        links = memory.current_links(subject, predicate)
+        stale = [update for update in memory.pending_facts() if update["predicate"] == predicate]
+    except Exception:
+        return _save_unfinished(
+            memory, fact,
+            "The current value could not be read, so nothing was replaced. "
+            "Repeat the command to finish",
+            predicate, obj,
+        )
+    olds = [link for link in links if not _names_match(link["object"], obj)]
+    moves = []
+    for link in olds:
+        try:
+            move = _old_fact_drawer(memory, fact, predicate, link)
+        except UnsafeReplacement as exc:
+            return _save_unfinished(memory, fact, str(exc), predicate, obj)
+        if move:
+            moves.append(move)
+
+    stored = _store_drawer(memory, fact, predicate, obj)
+    if stored is None:
+        return _not_saved("MemPalace could not store this fact.")
+    drawer_id, room = stored
+    old_names = ", ".join(link["object"] for link in olds)
+    for old_id, to_room in moves:
+        if old_id != drawer_id and not _move_drawer(memory, old_id, to_room):
+            return _pending(
+                "The earlier fact for %s could not be archived. Repeat the command to finish"
+                % old_names
+            )
+    try:
+        for link in olds:
+            memory.kg.supersede(
+                subject, predicate, link["object"], obj,
+                source_file="tinytalk", source_drawer_id=drawer_id,
+            )
+        if not links:
+            memory.kg.add_triple(
+                subject, predicate, obj, source_file="tinytalk", source_drawer_id=drawer_id
+            )
+    except Exception:
+        if olds:
+            return _pending(
+                "The knowledge graph still lists %s. Repeat the command to finish" % old_names
+            )
+        return _pending("The knowledge graph update failed. Repeat the command to finish")
+    debug("[debug] KG: %s -> %s -> %s" % triple)
+    finished = _finish(memory, drawer_id, room, stale)
+    if finished:
+        return finished
+    if olds:
+        return _status("replaced", "Memory: saved. Replaced %s." % old_names)
+    if room == FACT_ROOM and links and not [u for u in stale if u["drawer_id"] != drawer_id]:
+        return _status("already_saved", "Memory: already saved.")
+    return _status("saved", "Memory: saved.")
+
+
 def remember_fact(user_prompt, memory, provider):
-    if memory is None or memory.palace is None:
-        return
+    """Save a "Remember this:" fact and report what happened.
+
+    Returns {"status", "message"}, or None when the line is not a non-empty
+    "Remember this:" command. status is saved, replaced, already_saved,
+    saved_as_written (no relationship identified, so only the words were
+    stored), not_saved, or incomplete. An incomplete update keeps its words in
+    facts-pending, which recall does not treat as a current fact.
+    """
     if not user_prompt.lower().startswith("remember this:"):
-        return
+        return None
     fact = user_prompt[len("remember this:"):].strip()
     if not fact:
-        return
+        return None
+    if memory is None or memory.palace is None or getattr(memory, "add_drawer", None) is None:
+        return _not_saved("Saved memory is unavailable in this session.")
+    if memory.kg is None:
+        return _save_as_written(
+            memory, fact, "The knowledge graph is unavailable, so nothing was checked or replaced"
+        )
 
-    triple = None
-    if memory.kg is not None:
-        try:
-            triple = fact_to_triple(fact, provider)
-        except ProviderError as exc:
-            print("Warning: could not extract a knowledge-graph triple: %s" % exc)
-            triple = None
-        except Exception:
-            triple = None
-
-    save_fact = True
-    graph_action = "add" if triple else "skip"
-    if memory.kg is not None and triple and triple[1] in SINGLE_VALUE_PREDICATES:
-        subject, predicate, obj = triple
-        try:
-            current = memory.current_fact_objects(subject, predicate)
-        except Exception:
-            current = None
-        if current is None:
-            graph_action = "add"
-        elif not current:
-            graph_action = "add"
-        elif obj in current:
-            save_fact = False
-            graph_action = "skip"
-            try:
-                for old in current:
-                    if old == obj:
-                        continue
-                    memory.kg.invalidate(subject, predicate, old)
-                    try:
-                        memory.archive_replaced_fact(old)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-        else:
-            try:
-                for old in current:
-                    if old == obj:
-                        continue
-                    memory.kg.supersede(
-                        subject, predicate, old, obj, source_file="tinytalk"
-                    )
-                    try:
-                        memory.archive_replaced_fact(old)
-                    except Exception:
-                        pass
-                graph_action = "supersede"
-            except Exception:
-                graph_action = "add"
-
-    if save_fact:
-        try:
-            saved = memory.add_drawer(
-                wing="tinytalk",
-                room="facts",
-                content=fact,
-                source_file="tinytalk",
-                added_by="tinytalk",
-            )
-            if not saved.get("success"):
-                print("Warning: could not save this fact to MemPalace.")
-        except Exception:
-            print("Warning: could not save this fact to MemPalace.")
-    if memory.kg is not None and triple and graph_action == "add":
-        try:
-            memory.kg.add_triple(triple[0], triple[1], triple[2], source_file="tinytalk")
-            debug("[debug] KG: %s -> %s -> %s" % (triple[0], triple[1], triple[2]))
-        except Exception:
-            pass
-    elif triple and graph_action == "supersede":
-        debug("[debug] KG: %s -> %s -> %s" % (triple[0], triple[1], triple[2]))
+    try:
+        triple = fact_to_triple(fact, provider)
+    except ProviderError as exc:
+        print("Warning: could not extract a knowledge-graph triple: %s" % exc)
+        triple = None
+    except Exception:
+        triple = None
+    if triple is None:
+        return _save_as_written(
+            memory, fact,
+            "No clear fact could be extracted, so the knowledge graph was not updated "
+            "and nothing was replaced",
+        )
+    if triple[1] not in SINGLE_VALUE_PREDICATES:
+        return _save_additive(memory, fact, triple)
+    if triple[0].casefold() != "user" or triple[2].casefold() not in fact.casefold():
+        return _save_unfinished(
+            memory, fact, "The extracted fact did not clearly match the text, so nothing was replaced"
+        )
+    return _save_single_value(memory, fact, triple)
 
 
 def handle_turn(user_prompt, messages, provider, memory, soul, sources=None):
@@ -1100,8 +1501,12 @@ def handle_turn(user_prompt, messages, provider, memory, soul, sources=None):
             memory.save_exchange(user_prompt, response)
         except Exception:
             print("Warning: could not save this turn to MemPalace.")
-    remember_fact(user_prompt, memory, provider)
     print("%s: %s" % (provider.label, response))
+    # The reply was written before the fact was stored, so this line, not the
+    # reply, says what happened to the memory.
+    result = remember_fact(user_prompt, memory, provider)
+    if result is not None:
+        print(result["message"])
     print("-" * 30)
     return messages
 
