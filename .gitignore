@@ -5,3 +5,4 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .DS_Store
+TinyTalk-Audit-2026-10-04.md

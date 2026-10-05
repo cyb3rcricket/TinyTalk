@@ -202,7 +202,7 @@ class Afplay(object):
 
 
 class SpeechController(object):
-    """At most one background speech job. /stop drops playback of that job."""
+    """One current clip, and at most one stopped request still generating."""
 
     def __init__(self, client, player, output=None):
         self.client = client
@@ -212,6 +212,7 @@ class SpeechController(object):
         self._generation = 0
         self._phase = None
         self._thread = None
+        self._threads = []
 
     def speak_last(self, messages):
         text = last_assistant_answer(messages)
@@ -219,9 +220,16 @@ class SpeechController(object):
             self.output("There isn't an assistant answer to speak yet.")
             return
         with self._lock:
-            if self._thread is not None and self._thread.is_alive():
+            self._threads = [thread for thread in self._threads if thread.is_alive()]
+            if self._phase in ("starting", "generating", "playing"):
                 self.output(
                     "Speech is already in progress. "
+                    "TinyTalk did not start another clip."
+                )
+                return
+            if len(self._threads) >= 2:
+                self.output(
+                    "A stopped request is still generating. "
                     "TinyTalk did not start another clip."
                 )
                 return
@@ -234,19 +242,18 @@ class SpeechController(object):
             )
             thread.daemon = True
             self._thread = thread
+            self._threads.append(thread)
             thread.start()
         self.output("Speaking the last answer…")
 
     def stop(self, quiet=False):
         with self._lock:
             phase = self._phase
-            thread = self._thread
-            busy = thread is not None and thread.is_alive()
             self._generation += 1
             if phase in ("starting", "generating", "playing"):
                 self._phase = None
         self.player.stop()
-        if not busy and phase not in ("starting", "generating", "playing"):
+        if phase not in ("starting", "generating", "playing"):
             if not quiet:
                 self.output("Nothing is playing.")
             return
@@ -258,8 +265,9 @@ class SpeechController(object):
             )
 
     def join(self, timeout=None):
-        thread = self._thread
-        if thread is not None:
+        with self._lock:
+            threads = list(self._threads)
+        for thread in threads:
             thread.join(timeout)
 
     def _current(self, generation):
@@ -292,9 +300,6 @@ class SpeechController(object):
                 )
             return
         if not self._current(generation):
-            with self._lock:
-                if generation == self._generation:
-                    self._phase = None
             return
         with self._lock:
             if generation != self._generation:
