@@ -88,7 +88,7 @@ Completed conversations are saved through MemPalace in:
 tinytalk/conversations
 ```
 
-TinyTalk can search those old exchanges later when something from a previous conversation looks relevant.
+TinyTalk can search those old exchanges later when something from a previous conversation looks relevant. A conversation excerpt has to clear the same 0.45 similarity floor as a fact. A stored `Remember this:` line is current evidence only while that fact is still current. A command whose fact is in `facts-history` or `facts-abandoned` is left out. The saved exchange includes the final `Memory:` line, so a later search can see whether the save finished.
 
 So restarting the program clears the immediate chat window, but it doesn't necessarily mean TinyTalk forgot everything that happened before.
 
@@ -211,9 +211,13 @@ The goal isn't to erase the past.
 
 It's to stop confusing **what used to be true** with **what TinyTalk currently believes is true**.
 
-The graph edge for a single-value fact records which saved fact it came from, so replacing a value archives exactly that one fact. Other facts that happen to contain the same word stay where they are.
+The graph edge for a single-value fact records which saved fact it came from, so replacing a value archives that fact. Another current fact is archived with it only when its stored relationship metadata names the same predicate. Other facts that happen to contain the same word stay where they are.
 
-Edges saved before TinyTalk recorded that link have no such proof, and TinyTalk doesn't guess. It doesn't search for the old word or ask the model to re-read old facts. The one exception is `test_spaceship_name`: TinyTalk replaces it only when exactly one current fact parses as a test-spaceship name with the same value as the graph. That parse uses the same rule as the history questions. Any other unlinked value, such as a graph that says `New York City` next to a fact that says `I live in NYC.`, is left alone. The new words are kept as an unfinished update, and TinyTalk says so. No command moves the old records today.
+Saying the same single value again in different words does not create a second current fact. TinyTalk keeps the fact the graph already points at. The `Memory:` line says the value is already saved and that the new wording was not stored as another current fact. A repeated line whose update is already pending continues from the relationship stored on that pending fact. If extraction fails on that repeat, the pending fact is not promoted into current facts.
+
+If no relationship can be extracted on a first attempt, the words are still saved in `tinytalk/facts` and nothing in the graph is replaced. That drawer is labeled unclassified saved text: the words were kept, no relationship was confirmed, and it is not a current single-value fact. A later confirmed value does not delete those words.
+
+When the current edge has no drawer link and the new words state that same value, TinyTalk stores the fact and writes that drawer's id onto the open edge. A later change can then archive that fact. Edges saved before TinyTalk recorded that link otherwise have no such proof, and TinyTalk doesn't guess. It doesn't search for the old word or ask the model to re-read old facts. The one exception is `test_spaceship_name`: TinyTalk replaces it only when exactly one current fact parses as a test-spaceship name with the same value as the graph. That parse uses the same rule as the history questions. Any other unlinked value, such as a graph that says `New York City` next to a fact that says `I live in NYC.`, is left alone. The new words are kept as an unfinished update, and TinyTalk says so. No command moves the old records today.
 
 A replacement runs in this order:
 
@@ -227,7 +231,7 @@ Those are separate MemPalace writes, not one transaction. TinyTalk stops at the 
 
 Repeating the same `Remember this:` line carries on from the step that failed, without adding duplicate facts. A different value for the same relationship replaces the last finished value and moves the earlier unfinished attempt to `facts-abandoned`, where it stays visible but is never current. Repeating that abandoned line later is treated as a new replacement.
 
-If no clear fact can be extracted, only the words are saved, as before. They go into `facts`, and nothing in the graph changes or is replaced.
+If no clear fact can be extracted, only the words are saved, as before. They go into `facts` with the unclassified label, and nothing in the graph changes or is replaced. A repeat of a line that is already pending does not take this path.
 
 After the reply to a `Remember this:` line, TinyTalk prints one `Memory:` line. The reply was written before anything was stored, so that line is the one to trust:
 
@@ -303,7 +307,7 @@ What was the old name of my test spaceship?
 What was my test spaceship named previously?
 ```
 
-For those, it reads the current and inactive `test_spaceship_name` edges and the `tinytalk/facts` and `tinytalk/facts-history` rooms. Stored predicates pass through the same aliases as new facts. The labels name the current value and, when the records support one, the previous name. An inactive edge that repeats the current name is not a previous name. An archived test-spaceship fact fills in when the graph has no different earlier name. A separate imaginary-spaceship fact is not part of this relationship. Filing times are used only when they put the earlier names in order, and TinyTalk does not turn them into a rename date. Search order is not time order. If the records do not establish one previous name, the label says that. These questions do not replace saved facts. Every other question still uses the normal fact search.
+For those, it reads the current and inactive `test_spaceship_name` edges and the `tinytalk/facts` and `tinytalk/facts-history` rooms. Stored predicates pass through the same aliases as new facts. The labels name the current value and, when the records support one, the previous name. An inactive edge that repeats the current name is not a previous name. An archived test-spaceship fact fills in when the graph has no different earlier name. A separate imaginary-spaceship fact is not part of this relationship. Filing times are not used to put earlier names in order. Graph boundaries are, and TinyTalk does not turn them into a rename date. Search order is not time order. If the records do not establish one previous name, the label says that. These questions do not replace saved facts. Every other question still uses the normal fact search.
 
 ---
 
@@ -406,6 +410,8 @@ OLLAMA_MODEL=llama3.2:3b
 
 `TINYTALK_DEBUG` defaults to off. Set it to `1`, `true`, `yes`, or `on` to print fact-similarity scores and knowledge-graph updates. Save warnings and API errors stay visible either way. The startup line still names the provider in use.
 
+Each request stays within 24000 characters of text: the soul file, retrieved memories, recent chat, and the new message. 2000 of those characters are reserved for the reply. TinyTalk leaves out the oldest chat turns first. If that is not enough, it leaves out trailing retrieved records and says how many were omitted. A message that still cannot fit is refused, and nothing from that turn is saved. Set `TINYTALK_MAX_REQUEST_CHARS` to a positive integer to change the total. Anything else leaves 24000.
+
 Run it:
 
 ```bash
@@ -415,7 +421,7 @@ python3 tinytalk.py
 You'll get:
 
 ```text
-🤖 Hello! I'm your Llama assistant, running locally. (Type 'quit' to exit)
+🤖 Hello! I'm your llama3.2:3b assistant, running locally. (Type 'quit' to exit)
 Type /speak to hear the last answer, /stop to stop playback, or /sources to list memories included with the last answer.
 ------------------------------
 You:
@@ -483,12 +489,13 @@ After a successful assistant reply:
 
 - `/speak` speaks that reply. TinyTalk prints `Speaking the last answer…` and generates the audio in the background, so you can keep typing. When the clip is ready it plays through macOS `afplay`.
 - A second `/speak` while a clip is already being made or played does not start another one.
-- `/stop` stops playback. If generation is still in flight, TinyTalk discards the audio when it arrives and does not play it. VoiceStudio may still finish that request on the server; stopping playback does not cancel it.
-- `quit` also stops playback.
+- After `/stop`, one new `/speak` can start while that stopped request is still generating. One more `/speak` does not start a third clip. TinyTalk says the stopped request is still generating.
+- `/stop` stops playback. If generation is still in flight, TinyTalk discards the audio when it arrives and does not play it. VoiceStudio may still finish that request on the server; stopping playback does not cancel it. A later `/stop`, when nothing is playing, says that nothing is playing.
+- `quit` and Ctrl-C also stop playback. Ctrl-C exits the chat.
 
 `/speak` and `/stop` do not call Grok or Ollama, do not add a conversation turn, and do not save a memory. They speak only the last assistant message shown in the chat. The separate fact-extraction request is not spoken. They also leave the `/sources` list unchanged.
 
-The speech client is separate from the chat client. It allows 10 seconds to connect and 300 seconds for the whole request, and it does not retry. It does not send `XAI_API_KEY`. If VoiceStudio is down, times out, or returns an error, TinyTalk prints that and leaves text chat usable. The first clip after a cold model load can take several minutes. Later clips are faster while the model stays loaded.
+The speech client is separate from the chat client. It allows 10 seconds to connect and 300 seconds for each httpx operation (read, write, connect, and pool). That is not one deadline for the whole request. It does not retry. It does not send `XAI_API_KEY`. If VoiceStudio is down, times out, or returns an error, TinyTalk prints that and leaves text chat usable. The first clip after a cold model load can take several minutes. Later clips are faster while the model stays loaded.
 
 ## Troubleshooting
 

@@ -65,6 +65,7 @@ class SwitchingMemory(object):
             "text": "User: hello there\n\nAssistant: hi",
             "drawer_id": "drawer_convo",
             "filed_at": "unknown",
+            "similarity": 0.8,
         }]
 
     def save_exchange(self, user_prompt, response):
@@ -155,7 +156,7 @@ class SourceTests(unittest.TestCase):
                     },
                 ]
 
-            def list_drawers(self, wing, room, limit):
+            def list_drawers(self, wing, room, limit, offset=0):
                 if room == "facts":
                     return {"drawers": [
                         {
@@ -299,6 +300,66 @@ class SourceTests(unittest.TestCase):
             self.assertEqual(updated, messages)
             self.assertEqual(sources.records[0]["id"], "drawer_enterprise")
         self.assertEqual(speech.calls, ["speak", "stop"])
+
+
+class ConversationFloorTests(unittest.TestCase):
+    def _memory(self, hits, history=()):
+        class Memory(object):
+            palace = object()
+            kg = None
+
+            def search_facts(self, query):
+                return []
+
+            def search_conversations(self, query):
+                return hits
+
+            def unfinished_updates(self):
+                return []
+
+            def list_drawers(self, wing, room, limit=100, offset=0):
+                if room != "facts-history":
+                    return {"drawers": [], "total": 0}
+                drawers = [
+                    {
+                        "drawer_id": "history-%s" % index,
+                        "content_preview": text,
+                        "metadata": {},
+                    }
+                    for index, text in enumerate(history)
+                ]
+                return {"drawers": drawers[offset:offset + limit], "total": len(drawers)}
+
+        return Memory()
+
+    def _texts(self, hits, history=()):
+        _messages, sources = tinytalk.build_context(
+            "what should you call me",
+            [{"role": "user", "content": "what should you call me"}],
+            self._memory(hits, history),
+        )
+        return [source["text"] for source in sources if source["kind"] == "conversation excerpt"]
+
+    def test_a_low_similarity_excerpt_is_left_out(self):
+        hits = [{
+            "text": "User: Remember this: call me Al",
+            "similarity": 0.01,
+        }]
+        self.assertEqual(self._texts(hits), [])
+
+    def test_a_replaced_command_is_left_out(self):
+        hits = [{
+            "text": "User: Remember this: call me Al\n\nAssistant: Okay.",
+            "similarity": 0.8,
+        }]
+        self.assertEqual(self._texts(hits, history=("call me Al",)), [])
+
+    def test_ordinary_chatter_above_the_floor_is_included(self):
+        hits = [{
+            "text": "User: hello\n\nAssistant: hi",
+            "similarity": 0.8,
+        }]
+        self.assertEqual(self._texts(hits), ["User: hello\n\nAssistant: hi"])
 
 
 if __name__ == "__main__":

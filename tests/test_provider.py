@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import unittest
+import unittest.mock
 from contextlib import redirect_stdout
 from pathlib import Path
 
@@ -13,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from openai import APIConnectionError, AuthenticationError, NotFoundError, RateLimitError
 
 import tinytalk
+from speech import SpeechController
 from provider import (
     DEFAULT_OLLAMA_MODEL,
     DOCUMENTED_XAI_MODEL,
@@ -87,6 +89,17 @@ class ScriptedProvider(object):
         if isinstance(reply, Exception):
             raise reply
         return reply
+
+
+class StopPlayer(object):
+    def __init__(self):
+        self.stop_calls = 0
+
+    def play(self, wav_bytes, still_current):
+        return False
+
+    def stop(self):
+        self.stop_calls += 1
 
 
 class RecordingMemory(object):
@@ -341,6 +354,29 @@ class RoutingAndContextTests(unittest.TestCase):
         self.assertNotIn("search_parameters", sent)
         self.assertNotIn("reasoning", sent)
 
+    def test_ollama_label_and_greeting_follow_the_configured_model(self):
+        provider = OllamaProvider(FakeClient(), "qwen2.5:3b", sleep=lambda _s: None)
+        self.assertEqual(provider.label, "qwen2.5:3b")
+        self.assertIn("qwen2.5:3b", tinytalk.greeting(provider))
+        grok = GrokProvider(
+            FakeClient(),
+            DOCUMENTED_XAI_MODEL,
+            api_key="k",
+            sleep=lambda _s: None,
+        )
+        greeting = tinytalk.greeting(grok)
+        self.assertIn("Grok", greeting)
+        self.assertNotIn("qwen2.5:3b", greeting)
+
+    def test_soul_read_failure_names_the_file(self):
+        shown = io.StringIO()
+        with redirect_stdout(shown):
+            with unittest.mock.patch.object(Path, "read_text", side_effect=OSError("denied")):
+                text = tinytalk.load_soul()
+        self.assertEqual(text, "You are TinyTalk, a helpful local assistant.")
+        self.assertIn("SOUL.md", shown.getvalue())
+        self.assertIn("denied", shown.getvalue())
+
     def test_ollama_forwards_the_same_messages_to_chat_completions(self):
         messages = [
             {"role": "system", "content": "soul"},
@@ -361,6 +397,8 @@ class RoutingAndContextTests(unittest.TestCase):
         for index in range(12):
             prior.append({"role": "user", "content": "user-%s" % index})
             prior.append({"role": "assistant", "content": "assistant-%s" % index})
+        long_reply = "Z" * (tinytalk.MAX_REQUEST_CHARS)
+        prior[-1] = {"role": "assistant", "content": long_reply}
         memory = RecordingMemory(facts=["my test spaceship is named Enterprise"])
         soul = "SOUL TEXT"
         scripted = ScriptedProvider(["remembered"])
@@ -376,6 +414,9 @@ class RoutingAndContextTests(unittest.TestCase):
         self.assertIn("Enterprise", sent[1]["content"])
         self.assertEqual(sent[1]["role"], "system")
         self.assertEqual(sent[-1], {"role": "user", "content": "What is my test spaceship called?"})
+        sent_text = "\n".join(message["content"] for message in sent)
+        self.assertNotIn(long_reply, sent_text)
+        self.assertNotIn("user-0", sent_text)
         self.assertLessEqual(len(updated), tinytalk.MAX_TURNS * 2)
         self.assertNotIn("Enterprise", updated[-1]["content"])
         self.assertEqual(updated[-1]["content"], "remembered")
@@ -401,6 +442,80 @@ class RoutingAndContextTests(unittest.TestCase):
         self.assertIn("saved memories", memory_message)
         self.assertIn("model training", memory_message)
         self.assertIn("Enterprise", memory_message)
+        self.assertTrue(tinytalk.is_memory_introspection("What  do you remember about me?"))
+        self.assertFalse(tinytalk.is_memory_introspection("what do you remember about the ship"))
+
+    def test_an_oversized_user_line_is_not_sent(self):
+        scripted = ScriptedProvider(["should not be called"])
+        memory = RecordingMemory()
+        sources = tinytalk.SessionSources()
+        sources.replace([{"kind": "saved fact", "text": "keep me"}])
+        huge = "x" * tinytalk.MAX_REQUEST_CHARS
+        shown = io.StringIO()
+        with redirect_stdout(shown):
+            updated = tinytalk.handle_turn(huge, [{"role": "user", "content": "old"}], scripted, memory, "SOUL", sources)
+        self.assertEqual(scripted.calls, [])
+        self.assertEqual(updated, [{"role": "user", "content": "old"}])
+        self.assertEqual(memory.saved, [])
+        self.assertEqual(sources.records, [{"kind": "saved fact", "text": "keep me"}])
+        self.assertIn(str(tinytalk.MAX_REQUEST_CHARS), shown.getvalue())
+        self.assertIn("Nothing was saved.", shown.getvalue())
+
+    def test_trailing_records_are_omitted_with_a_count(self):
+        facts = ["fact-%s %s" % (index, "z" * 400) for index in range(6)]
+        memory = RecordingMemory(facts=facts)
+        scripted = ScriptedProvider(["partial"])
+        previous = os.environ.get("TINYTALK_MAX_REQUEST_CHARS")
+        os.environ["TINYTALK_MAX_REQUEST_CHARS"] = "4000"
+        try:
+            tinytalk.handle_turn(
+                "What do you remember about me?",
+                [],
+                scripted,
+                memory,
+                "SOUL",
+            )
+        finally:
+            if previous is None:
+                os.environ.pop("TINYTALK_MAX_REQUEST_CHARS", None)
+            else:
+                os.environ["TINYTALK_MAX_REQUEST_CHARS"] = previous
+        self.assertEqual(len(scripted.calls), 1)
+        body = scripted.calls[0][1]["content"]
+        self.assertIn("fact-0", body)
+        self.assertNotIn("fact-5", body)
+        self.assertIn("retrieved records were omitted", body)
+        self.assertIn("4000", body)
+
+    def test_interrupt_at_the_prompt_stops_speech(self):
+        player = StopPlayer()
+        speech = SpeechController(object(), player, lambda _message: None)
+
+        def read_line(_prompt):
+            raise KeyboardInterrupt
+
+        tinytalk.run_repl(ScriptedProvider(["nope"]), None, "SOUL", speech, None, read_line)
+        self.assertGreaterEqual(player.stop_calls, 1)
+
+    def test_interrupt_during_a_turn_stops_speech(self):
+        player = StopPlayer()
+        speech = SpeechController(object(), player, lambda _message: None)
+
+        class Boom(object):
+            label = "Script"
+
+            def complete(self, messages):
+                raise KeyboardInterrupt
+
+        def read_line(_prompt):
+            return "hello"
+
+        shown = io.StringIO()
+        with redirect_stdout(shown):
+            updated = tinytalk.run_repl(Boom(), None, "SOUL", speech, None, read_line)
+        self.assertEqual(updated, [])
+        self.assertGreaterEqual(player.stop_calls, 1)
+        self.assertNotIn("Script:", shown.getvalue())
 
     def test_debug_lines_stay_hidden_unless_enabled(self):
         class Graph(object):

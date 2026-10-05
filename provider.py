@@ -262,11 +262,11 @@ def call_with_retries(operation, explain, sleep):
 
 class OllamaProvider(object):
     name = "ollama"
-    label = "Llama"
 
     def __init__(self, client, model, sleep=time.sleep):
         self.client = client
         self.model = model
+        self.label = model
         self.sleep = sleep
 
     def complete(self, messages):

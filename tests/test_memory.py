@@ -19,6 +19,81 @@ import tinytalk
 from provider import ProviderError
 
 
+class GraphScanTests(unittest.TestCase):
+    def _memory(self, triples):
+        calls = []
+
+        class KG(object):
+            def dump_rows(self, table, after_rowid=0, limit=1000):
+                calls.append(table)
+                if table == "entities":
+                    rows = [{"id": "user", "name": "user", "_rowid": 1}]
+                    for index, row in enumerate(triples, 2):
+                        rows.append({
+                            "id": row["object_id"],
+                            "name": row["object"],
+                            "_rowid": index,
+                        })
+                    return rows
+                return [
+                    {
+                        "id": "t-%s" % index,
+                        "subject": "user",
+                        "predicate": row["predicate"],
+                        "object": row["object_id"],
+                        "valid_to": None,
+                        "source_drawer_id": row.get("source_drawer_id"),
+                        "_rowid": index,
+                    }
+                    for index, row in enumerate(triples, 1)
+                ]
+
+        def list_drawers(wing, room, limit, offset=0):
+            if offset or room != "facts-pending":
+                return {"drawers": [], "total": 0}
+            drawers = []
+            for text, predicate, obj in (
+                ("call me Al", "preferred_name", "Al"),
+                ("call me Sam", "preferred_name", "Sam"),
+            ):
+                drawers.append({
+                    "drawer_id": text,
+                    "content_preview": text,
+                    "metadata": {
+                        "source_file": "tinytalk?predicate=%s&object=%s" % (predicate, obj),
+                    },
+                })
+            return {"drawers": drawers, "total": len(drawers)}
+
+        memory = tinytalk.MemoryStore(object(), "/tmp/unused", KG(), None, list_drawers, None)
+        return memory, calls
+
+    def test_unfinished_updates_read_the_graph_once(self):
+        memory, calls = self._memory([{
+            "predicate": "preferred_name",
+            "object": "Al",
+            "object_id": "al",
+        }])
+        updates = memory.unfinished_updates()
+        self.assertEqual(calls, ["entities", "triples"])
+        self.assertEqual([update["last_value"] for update in updates], ["Al", "Al"])
+
+    def test_current_links_match_an_alias_and_skip_the_imaginary_ship(self):
+        memory, _calls = self._memory([
+            {"predicate": "test_spaceship", "object": "Serenity", "object_id": "serenity"},
+            {"predicate": "spaceship_name", "object": "Serenity", "object_id": "serenity"},
+            {
+                "predicate": "imaginary_spaceship_name",
+                "object": "Nostromo",
+                "object_id": "nostromo",
+            },
+        ])
+        ships = memory.current_links("user", "test_spaceship_name")
+        self.assertEqual([link["object"] for link in ships], ["Serenity", "Serenity"])
+        imaginary = memory.current_links("user", "imaginary_spaceship_name")
+        self.assertEqual([link["object"] for link in imaginary], ["Nostromo"])
+
+
 class ScriptedProvider(object):
     name = "scripted"
     label = "Script"
@@ -253,13 +328,13 @@ def _fact_drawer(room, text, filed_at=None):
     }
 
 
-def _graph_edge(predicate, obj, current, valid_to=None):
+def _graph_edge(predicate, obj, current, valid_to=None, valid_from=None):
     return {
         "subject": "user",
         "predicate": predicate,
         "object": obj,
         "current": current,
-        "valid_from": None,
+        "valid_from": valid_from,
         "valid_to": valid_to,
     }
 
@@ -413,7 +488,7 @@ class TestSpaceshipHistoryTests(unittest.TestCase):
             self.assertNotIn("Serenity", body)
             self.assertNotIn("Nostromo", body)
 
-    def test_timestamps_can_order_earlier_names_and_a_later_stamp_cannot(self):
+    def test_filing_times_do_not_order_earlier_names(self):
         graph = [_graph_edge("test_spaceship_name", "Enterprise", True)]
         current = _fact_drawer(
             "facts",
@@ -432,17 +507,52 @@ class TestSpaceshipHistoryTests(unittest.TestCase):
         )
         question = "What was the previous name of my test spaceship?"
         body = _history_body(graph, [nostromo, serenity, current], question)
-        self.assertIn("Previous name: Nostromo", body)
-        self.assertNotIn("Serenity", body)
+        self.assertIn("Previous name: not established", body)
+        self.assertIn("More than one earlier", body)
+        self.assertNotIn("Previous name: Nostromo", body)
+        self.assertNotIn("Previous name: Serenity", body)
         late = _fact_drawer(
             "facts-history",
             "my test spaceship is named Serenity.",
             "2026-09-28T01:00:00",
         )
-        rejected = _history_body(graph, [current, late], question)
-        self.assertIn("Previous name: not established", rejected)
-        self.assertIn("does not establish it as the previous name", rejected)
-        self.assertNotIn("Serenity", rejected)
+        accepted = _history_body(graph, [current, late], question)
+        self.assertIn("Previous name: Serenity", accepted)
+        self.assertNotIn("2026-09-28", accepted)
+
+    def test_graph_boundaries_order_names_when_filing_times_do_not(self):
+        graph = [
+            _graph_edge(
+                "test_spaceship_name", "Serenity", False,
+                valid_from="2026-08-01T00:00:00Z",
+                valid_to="2026-09-01T00:00:00Z",
+            ),
+            _graph_edge(
+                "test_spaceship_name", "Enterprise", False,
+                valid_from="2026-09-01T00:00:00Z",
+                valid_to="2026-10-01T00:00:00Z",
+            ),
+            _graph_edge(
+                "test_spaceship_name", "Voyager", True,
+                valid_from="2026-10-01T00:00:00Z",
+            ),
+        ]
+        # Filing times disagree with the graph: Serenity is filed last.
+        drawers = [
+            _fact_drawer("facts", "my test spaceship is named Voyager", "2026-09-01T00:00:00"),
+            _fact_drawer(
+                "facts-history", "my test spaceship is named Enterprise", "2026-08-01T00:00:00"
+            ),
+            _fact_drawer(
+                "facts-history", "my test spaceship is named Serenity.", "2026-10-02T00:00:00"
+            ),
+        ]
+        body = _history_body(graph, drawers, "What was the previous name of my test spaceship?")
+        self.assertIn("Current name: Voyager", body)
+        self.assertIn("Previous name: Enterprise", body)
+        self.assertNotIn("Previous name: Serenity", body)
+        self.assertNotIn("2026-10-01", body)
+        self.assertIn("Do not give a rename date.", body)
 
     def test_an_aliased_graph_edge_supplies_the_name_when_history_has_no_fact(self):
         graph = [
@@ -469,8 +579,8 @@ class TestSpaceshipHistoryTests(unittest.TestCase):
             palace = object()
             kg = None
 
-            def list_drawers(self, wing, room, limit):
-                self.calls.append((wing, room, limit))
+            def list_drawers(self, wing, room, limit, offset=0):
+                self.calls.append((wing, room, limit, offset))
                 if room == "facts":
                     return {"drawers": [
                         _fact_drawer("facts", "my test spaceship is named Enterprise"),
@@ -498,7 +608,7 @@ class TestSpaceshipHistoryTests(unittest.TestCase):
         )
         self.assertEqual(
             guard.calls,
-            [("tinytalk", "facts", 100), ("tinytalk", "facts-history", 100)],
+            [("tinytalk", "facts", 100, 0), ("tinytalk", "facts-history", 100, 0)],
         )
         self.assertIn("Previous name: Serenity", messages[0]["content"])
         self.assertNotIn("Picklewagon", messages[0]["content"])
@@ -596,6 +706,78 @@ def _record_snapshot(memory):
             row.get("valid_to"),
         ))
     return (tuple(sorted(rooms)), tuple(sorted(rows)))
+
+
+class FullFactReadTests(unittest.TestCase):
+    def test_introspection_reads_past_the_first_hundred_facts(self):
+        facts = ["fact number %s" % index for index in range(102)]
+
+        class Memory(object):
+            palace = object()
+
+            def list_drawers(self, wing, room, limit=100, offset=0):
+                page = facts[offset:offset + limit]
+                return {
+                    "drawers": [
+                        {
+                            "drawer_id": "fact-%s" % (offset + index),
+                            "content_preview": text,
+                            "metadata": {"room": room},
+                        }
+                        for index, text in enumerate(page)
+                    ],
+                    "total": len(facts),
+                }
+
+            def unfinished_updates(self):
+                return []
+
+        _messages, sources = tinytalk.build_context(
+            "What do you remember about me?",
+            [{"role": "user", "content": "What do you remember about me?"}],
+            Memory(),
+        )
+        texts = [source["text"] for source in sources if source["kind"] == "saved fact"]
+        self.assertEqual(texts, facts)
+
+    def test_history_reads_a_name_past_the_preview(self):
+        prefix = "a" * 190
+        full = prefix + " my test spaceship is named Serenity."
+        preview = full[:200] + "..."
+
+        class Memory(object):
+            palace = object()
+            kg = None
+
+            def list_drawers(self, wing, room, limit=100, offset=0):
+                if offset:
+                    return {"drawers": [], "total": 1}
+                if room == "facts":
+                    item = _fact_drawer("facts", "my test spaceship is named Enterprise")
+                else:
+                    item = {
+                        "drawer_id": "long-serenity",
+                        "room": room,
+                        "content_preview": preview,
+                        "metadata": {"room": room},
+                    }
+                return {"drawers": [item], "total": 1}
+
+            def get_drawer(self, drawer_id):
+                if drawer_id != "long-serenity":
+                    return {"error": "Drawer not found: %s" % drawer_id}
+                return {"content": full, "room": "facts-history", "metadata": {}}
+
+            def search_facts(self, query):
+                raise AssertionError(query)
+
+        messages = tinytalk.context_messages(
+            "What was the previous name of my test spaceship?",
+            [],
+            Memory(),
+        )
+        self.assertIn("Previous name: Serenity", messages[0]["content"])
+        self.assertNotIn(preview, messages[0]["content"])
 
 
 if __name__ == "__main__":

@@ -93,10 +93,13 @@ class FactReplacementTests(unittest.TestCase):
     def provider(self, **extra):
         answers = {
             "call me Al": triple("preferred_name", "Al"),
+            "my preferred name is Al": triple("preferred_name", "Al"),
             "call me Sam": triple("preferred_name", "Sam"),
             "my favorite meal is ramen": triple("favorite_meal", "ramen"),
             "I grew up in Dallas": triple("childhood_city", "Dallas"),
             "I live in Nashville.": triple("home_city", "Nashville"),
+            "I live in Nashville": triple("home_city", "Nashville"),
+            "I live in Memphis": triple("home_city", "Memphis"),
             "my test spaceship is named Serenity": triple(SHIP, "Serenity"),
             "my test spaceship is named Enterprise": triple(SHIP, "Enterprise"),
             "my test spaceship is named Voyager": triple(SHIP, "Voyager"),
@@ -200,6 +203,34 @@ class FactReplacementTests(unittest.TestCase):
 
     # -- records written before drawer links ----------------------------
 
+    def test_legacy_alias_edge_is_replaced_and_the_imaginary_ship_stays(self):
+        self.legacy_fact("my test spaceship is named Serenity")
+        self.legacy_fact("my imaginary spaceship is named Nostromo")
+        self.memory.kg.add_triple("user", "test_spaceship", "Serenity", source_file="tinytalk")
+        self.memory.kg.add_triple(
+            "user", "imaginary_spaceship_name", "Nostromo", source_file="tinytalk"
+        )
+        self.assertEqual(self.memory.current_fact_objects("user", SHIP), ["Serenity"])
+        self.assertEqual(
+            self.memory.current_fact_objects("user", "imaginary_spaceship_name"),
+            ["Nostromo"],
+        )
+        provider = self.provider()
+
+        result = remember(self.memory, provider, "my test spaceship is named Enterprise")
+
+        self.assertEqual(result["status"], "replaced")
+        self.assertEqual(self.memory.current_fact_objects("user", SHIP), ["Enterprise"])
+        self.assertEqual(
+            self.memory.current_fact_objects("user", "imaginary_spaceship_name"),
+            ["Nostromo"],
+        )
+        self.assertIn("my imaginary spaceship is named Nostromo", room_texts(self.memory, "facts"))
+        self.assertEqual(
+            room_texts(self.memory, "facts-history"),
+            ["my test spaceship is named Serenity"],
+        )
+
     def test_legacy_test_spaceship_edge_uses_the_parser_not_the_model(self):
         for fact in (
             "my test spaceship is named Serenity",
@@ -230,7 +261,7 @@ class FactReplacementTests(unittest.TestCase):
             self.assertEqual(result["status"], "incomplete")
             self.assertTrue(result["message"].startswith("Memory: saved as written, but not as a current fact."))
             self.assertIn("New York City is not linked to one saved fact", result["message"])
-        self.assertEqual(provider.extractions, ["I live in Nashville.", "I live in Nashville."])
+        self.assertEqual(provider.extractions, ["I live in Nashville."])
         self.assertEqual(self.rooms(), {
             "facts": ["I live in NYC.", "my favorite meal is ramen"],
             "facts-history": [],
@@ -392,10 +423,13 @@ class FactReplacementTests(unittest.TestCase):
             "facts-abandoned": [],
         })
         self.assertEqual(self.memory.current_fact_objects("user", SHIP), ["Serenity"])
-        # No current fact matches now, so recall falls back to conversations.
-        # The stored "Remember this:" turn for Enterprise is left out.
+        # No current fact matches. The unrelated hello exchange is below the
+        # conversation floor. The stored "Remember this:" turn for Enterprise
+        # is an unfinished update, so it is not injected as an excerpt.
         body, sources = context(self.memory, SHIP_QUESTION)
-        self.assertTrue(any("hello" in text for text in kinds(sources, "conversation excerpt")))
+        excerpts = kinds(sources, "conversation excerpt")
+        self.assertFalse(any("hello" in text for text in excerpts))
+        self.assertFalse(any("Enterprise" in text for text in excerpts))
         self.assert_serenity_is_still_current("The last completed test_spaceship_name is Serenity.")
 
         kg.supersede = real_supersede
@@ -525,13 +559,139 @@ class FactReplacementTests(unittest.TestCase):
 
         self.assertEqual(repaired, {"status": "saved", "message": "Memory: saved."})
         self.assertEqual(self.rooms()["facts"], ["my test spaceship is named Enterprise"])
-        self.assertEqual(len(ship_rows(self.memory)), 1)
+        open_rows = [row for row in ship_rows(self.memory) if row["valid_to"] is None]
+        self.assertEqual(len(open_rows), 1)
+        drawers = tinytalk._room_drawers(self.memory, "facts")
+        self.assertEqual(open_rows[0]["source_drawer_id"], drawers[0]["drawer_id"])
 
         again = remember(self.memory, provider, "my test spaceship is named Enterprise")
         self.assertEqual(again["status"], "already_saved")
         self.assertEqual(self.rooms()["facts"], ["my test spaceship is named Enterprise"])
         self.assertEqual(len(ship_rows(self.memory)), 1)
         self.assert_finished("Enterprise")
+
+    def test_graph_only_home_city_link_survives_replacement(self):
+        self.memory.kg.add_triple("user", "home_city", "Nashville", source_file="tinytalk")
+        provider = self.provider()
+
+        repaired = remember(self.memory, provider, "I live in Nashville")
+        self.assertEqual(repaired, {"status": "saved", "message": "Memory: saved."})
+        open_rows = [
+            row for row in tinytalk._graph_rows(self.memory.kg, "triples")
+            if row["predicate"] == "home_city" and row["valid_to"] is None
+        ]
+        drawers = [
+            drawer for drawer in tinytalk._room_drawers(self.memory, "facts")
+            if drawer["text"] == "I live in Nashville"
+        ]
+        self.assertEqual(len(open_rows), 1)
+        self.assertEqual(len(drawers), 1)
+        self.assertEqual(open_rows[0]["source_drawer_id"], drawers[0]["drawer_id"])
+
+        replaced = remember(self.memory, provider, "I live in Memphis")
+        self.assertEqual(replaced["status"], "replaced")
+        self.assertIn("Nashville", replaced["message"])
+        self.assertEqual(self.rooms()["facts"], ["I live in Memphis"])
+        self.assertEqual(self.rooms()["facts-history"], ["I live in Nashville"])
+        self.assertEqual(self.memory.current_fact_objects("user", "home_city"), ["Memphis"])
+
+    def test_remember_conversation_includes_the_memory_line(self):
+        provider = self.provider()
+        provider.reply = "Got it."
+        lines = self.turn(provider, "Remember this: call me Al")
+        self.assertEqual(lines[1], "Memory: saved.")
+        listed = self.memory.list_drawers(wing="tinytalk", room="conversations", limit=10)
+        texts = [item.get("content_preview") or "" for item in listed.get("drawers") or []]
+        self.assertTrue(any("Memory: saved." in text and "call me Al" in text for text in texts))
+
+    def test_a_paraphrase_does_not_become_a_second_current_fact(self):
+        provider = self.provider()
+        self.assertEqual(remember(self.memory, provider, "call me Al")["status"], "saved")
+
+        paraphrase = remember(self.memory, provider, "my preferred name is Al")
+
+        self.assertEqual(paraphrase["status"], "already_saved")
+        self.assertIn("The current preferred_name is Al.", paraphrase["message"])
+        self.assertIn("not stored as a second current fact", paraphrase["message"])
+        self.assertEqual(self.rooms()["facts"], ["call me Al"])
+        self.assertEqual(self.rooms()["facts-pending"], [])
+        self.assertEqual(self.memory.current_fact_objects("user", "preferred_name"), ["Al"])
+
+        replaced = remember(self.memory, provider, "call me Sam")
+        self.assertEqual(replaced, {"status": "replaced", "message": "Memory: saved. Replaced Al."})
+        self.assertEqual(self.rooms()["facts"], ["call me Sam"])
+        self.assertEqual(self.rooms()["facts-history"], ["call me Al"])
+        self.assertNotIn("my preferred name is Al", self.rooms()["facts"])
+        self.assertEqual(self.memory.current_fact_objects("user", "preferred_name"), ["Sam"])
+
+    def test_a_later_replacement_retires_an_unlinked_paraphrase(self):
+        provider = self.provider()
+        self.assertEqual(remember(self.memory, provider, "call me Al")["status"], "saved")
+        saved = self.memory.add_drawer(
+            wing="tinytalk",
+            room="facts",
+            content="my preferred name is Al",
+            source_file=tinytalk._fact_source_file("preferred_name", "Al"),
+            added_by="tinytalk",
+        )
+        self.assertTrue(saved.get("success"))
+
+        replaced = remember(self.memory, provider, "call me Sam")
+
+        self.assertEqual(replaced["status"], "replaced")
+        self.assertEqual(self.rooms()["facts"], ["call me Sam"])
+        self.assertEqual(
+            self.rooms()["facts-history"],
+            sorted(["call me Al", "my preferred name is Al"]),
+        )
+        self.assertEqual(self.memory.current_fact_objects("user", "preferred_name"), ["Sam"])
+
+    def test_failed_extraction_resumes_a_pending_replacement(self):
+        provider = self.provider()
+        self.assertEqual(remember(self.memory, provider, "call me Al")["status"], "saved")
+        real_supersede = self.memory.kg.supersede
+
+        def broken(*args, **kwargs):
+            raise RuntimeError("database is locked")
+
+        self.memory.kg.supersede = broken
+        pending = remember(self.memory, provider, "call me Sam")
+        self.assertEqual(pending["status"], "incomplete")
+        self.assertIn("call me Sam", self.rooms()["facts-pending"])
+        self.assertEqual(self.rooms()["facts"], [])
+        self.assertEqual(self.memory.current_fact_objects("user", "preferred_name"), ["Al"])
+
+        self.memory.kg.supersede = real_supersede
+        provider.answers["call me Sam"] = "not json"
+        extracted = len(provider.extractions)
+        retried = remember(self.memory, provider, "call me Sam")
+
+        self.assertEqual(provider.extractions[extracted:], [])
+        self.assertEqual(retried, {"status": "replaced", "message": "Memory: saved. Replaced Al."})
+        self.assertEqual(self.rooms()["facts"], ["call me Sam"])
+        self.assertEqual(self.rooms()["facts-history"], ["call me Al"])
+        self.assertEqual(self.rooms()["facts-pending"], [])
+        self.assertEqual(self.memory.current_fact_objects("user", "preferred_name"), ["Sam"])
+
+    def test_unclassified_text_stays_out_of_the_single_value_fact(self):
+        provider = self.provider()
+        provider.answers["call me Al"] = "not json"
+        written = remember(self.memory, provider, "call me Al")
+        self.assertEqual(written["status"], "saved_as_written")
+        self.assertIn("call me Al", self.rooms()["facts"])
+        self.assertEqual(self.memory.current_fact_objects("user", "preferred_name"), [])
+
+        saved = remember(self.memory, provider, "call me Sam")
+        self.assertEqual(saved["status"], "saved")
+        self.assertEqual(self.memory.current_fact_objects("user", "preferred_name"), ["Sam"])
+        self.assertIn("call me Al", self.rooms()["facts"])
+        self.assertIn("call me Sam", self.rooms()["facts"])
+
+        body, sources = context(self.memory, "What do you remember about me?")
+        self.assertIn("call me Al", kinds(sources, tinytalk.UNCLASSIFIED_KIND))
+        self.assertIn("call me Sam", kinds(sources, "saved fact"))
+        self.assertNotIn("call me Al", kinds(sources, "saved fact"))
+        self.assertIn("not a current single-value fact", body)
 
     def test_repeated_success_does_not_duplicate(self):
         provider = self.provider()
