@@ -94,8 +94,13 @@ class SourceTests(unittest.TestCase):
         self.assertIn("filed: 2026-09-27T23:08:05", prompt)
         self.assertIn("not necessarily when the fact changed", prompt)
         self.assertIn("retrieved source", prompt)
-        self.assertEqual(sources.records[0]["kind"], "saved fact")
-        self.assertEqual(sources.records[0]["id"], "drawer_enterprise")
+        saved = next(
+            record for record in sources.records
+            if record.get("selection") == "semantic fact"
+        )
+        self.assertEqual(saved["kind"], "saved fact")
+        self.assertEqual(saved["id"], "drawer_enterprise")
+        self.assertEqual(saved["status"], "current")
 
         report = io.StringIO()
         with redirect_stdout(report):
@@ -119,14 +124,31 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(len(memory.saved), 1)
 
         memory.mode = "conversation"
-        self._turn(memory, provider, sources, "What did we say?")
+        printed = io.StringIO()
+        with redirect_stdout(printed):
+            tinytalk.handle_user_line(
+                "/recall what did we say?",
+                [],
+                provider,
+                memory,
+                "SOUL",
+                FakeSpeech(),
+                sources,
+            )
         convo = provider.calls[-1][1]["content"]
         self.assertIn("[conversation excerpt]", convo)
+        self.assertIn("explicit history recall", convo)
+        self.assertIn("status: historical", convo)
         self.assertIn("id: drawer_convo", convo)
         self.assertIn("User: hello there\n\nAssistant: hi", convo)
         self.assertNotIn("filed:", convo)
-        self.assertEqual(sources.records[0]["kind"], "conversation excerpt")
-        self.assertNotIn("filed_at", sources.records[0])
+        excerpt = next(
+            record for record in sources.records
+            if record["kind"] == "conversation excerpt"
+        )
+        self.assertEqual(excerpt["selection"], "explicit history recall")
+        self.assertEqual(excerpt["status"], "historical")
+        self.assertNotIn("filed_at", excerpt)
 
     def test_historical_sources_exclude_the_imaginary_spaceship(self):
         class Memory(object):
@@ -231,7 +253,7 @@ class SourceTests(unittest.TestCase):
         ])
         self._turn(memory, provider, sources, "What is my test spaceship called?")
         kept = list(sources.records)
-        self.assertEqual(kept[0]["id"], "drawer_enterprise")
+        self.assertTrue(any(record.get("id") == "drawer_enterprise" for record in kept))
         printed = io.StringIO()
         with redirect_stdout(printed):
             history = tinytalk.handle_turn(
@@ -248,8 +270,10 @@ class SourceTests(unittest.TestCase):
 
         memory.mode = "empty"
         self._turn(memory, provider, sources, "Something else")
-        self.assertEqual(sources.records, [])
-        report = tinytalk.format_sources_report(sources.records)
+        self.assertFalse(any(record.get("id") == "drawer_enterprise" for record in sources.records))
+        self.assertTrue(sources.records)
+        self.assertTrue(all(record.get("status") == "unavailable" for record in sources.records))
+        report = tinytalk.format_sources_report([])
         self.assertIn("No saved memories were included", report)
         self.assertIn("does not mean no memories exist", report)
         self.assertIn("does not mean the answer came only from model knowledge", report)
@@ -333,9 +357,9 @@ class ConversationFloorTests(unittest.TestCase):
         return Memory()
 
     def _texts(self, hits, history=()):
-        _messages, sources = tinytalk.build_context(
-            "what should you call me",
-            [{"role": "user", "content": "what should you call me"}],
+        _messages, sources = tinytalk.recall_context(
+            "what did we say",
+            [{"role": "user", "content": "/recall what did we say"}],
             self._memory(hits, history),
         )
         return [source["text"] for source in sources if source["kind"] == "conversation excerpt"]
