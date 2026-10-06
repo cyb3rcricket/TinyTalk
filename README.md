@@ -88,7 +88,13 @@ Completed conversations are saved through MemPalace in:
 tinytalk/conversations
 ```
 
-TinyTalk can search those old exchanges later when something from a previous conversation looks relevant. A conversation excerpt has to clear the same 0.45 similarity floor as a fact. A stored `Remember this:` line is current evidence only while that fact is still current. A command whose fact is in `facts-history` or `facts-abandoned` is left out. The saved exchange includes the final `Memory:` line, so a later search can see whether the save finished.
+TinyTalk still saves those exchanges. It does not search them on an ordinary question. Ask with `/recall` and a short query when you want an old chat:
+
+```text
+/recall what did we say about the trip
+```
+
+`/recall` with no query prints usage and does not search. A recalled excerpt has to clear the same 0.45 similarity floor as a fact. A stored `Remember this:` line is included only while that fact is still current. A command whose fact is in `facts-history` or `facts-abandoned` is left out. The saved exchange includes the final `Memory:` line, so a later search can see whether the save finished. Recalled text is historical. An old assistant line does not become a current personal fact. A record whose speaker roles cannot be read stays opaque historical text.
 
 So restarting the program clears the immediate chat window, but it doesn't necessarily mean TinyTalk forgot everything that happened before.
 
@@ -112,7 +118,19 @@ tinytalk/facts
 
 These are things I explicitly told it to remember, so TinyTalk treats them as stronger evidence than something it happens to recover from an old conversation.
 
-For normal questions, it searches those facts semantically.
+Five single-value fields are read exactly on every ordinary turn, from the knowledge graph and the fact drawers, with no embedding search: `preferred_name`, `home_city`, `current_job`, `favorite_vehicle`, and `test_spaceship_name`. The profile is rebuilt each request. It is not a second database. A current value needs one open graph edge, a fact drawer in `tinytalk/facts`, and metadata that names the same relationship. A graph edge with no drawer, a missing drawer, or disagreeing metadata stays unresolved. An unfinished `Remember this:` stays pending, and the proposed value is not called current.
+
+These three questions are answered from that profile without calling the model:
+
+```text
+What is my name?
+What is my preferred name?
+What should you call me?
+```
+
+Any other wording still goes to Ollama or Grok, with the same profile included. Saying `call me River` in the chat is followed for this session and is not saved. A permanent change is still `Remember this:`.
+
+Other explicit facts are searched semantically.
 
 Right now the minimum similarity score is:
 
@@ -152,11 +170,13 @@ isn't particularly similar to any one fact.
 
 So TinyTalk now recognizes a few broad memory questions and directly reads the current fact list instead of trying to similarity-search it.
 
-That list is only the saved facts retrieved for that request. The instruction says so. It also says the list is not a complete inventory of stored conversations, that other memories may exist even when they were not included, and that these facts are saved memories rather than something the model learned in training. The same limits are attached when a similar fact or an old conversation excerpt is included.
+That list is only the saved facts retrieved for that request, with the current profile in front of it. The instruction says so. It also says the list is not a complete inventory of stored conversations, that other memories may exist even when they were not included, and that these facts are saved memories rather than something the model learned in training. The same limits are attached when a similar fact or an explicit `/recall` excerpt is included.
 
-Each included record is labelled as a saved fact, a conversation excerpt, an archived fact, or a knowledge-graph record. The original text stays as it was stored. An id or a timestamp is shown only when the record already has one. A filing time or a graph time is not a date the real-world fact changed.
+Each included record is labelled as a saved fact, a current profile notice, a conversation excerpt, an archived fact, a knowledge-graph record, an unfinished update, or unclassified saved text. A profile or recall record also says how it was selected (`profile lookup`, `semantic fact`, or `explicit history recall`) and whether it is current, pending, historical, missing, conflicting, or unavailable. The original text stays as it was stored. An id or a timestamp is shown only when the record already has one. A filing time or a graph time is not a date the real-world fact changed.
 
-TinyTalk does not print those labels after every answer. `/sources` prints the records included with the last successful answer: the type, any stored id, and a short preview. It shows the sources supplied with that answer. It does not prove which sources the model used. If none were included, it says that, without claiming that no memories exist or that the answer came only from model knowledge. `/sources` does not call the model or save a memory. A failed reply leaves the previous list in place. `/speak` and `/stop` leave it in place too. The list lasts for this terminal session only.
+TinyTalk does not print those labels after every answer. `/sources` prints the records included with the last successful answer: the type, the selection, the status, any stored id, and a short preview. It shows the sources supplied with that answer. It does not prove which sources the model used. If none were included, it says that, without claiming that no memories exist or that the answer came only from model knowledge. `/sources` does not call the model or save a memory. A failed reply leaves the previous list in place. `/speak`, `/stop`, and `/memory` leave it in place too. The list lasts for this terminal session only.
+
+`/memory` prints the five profile fields from the resolver: state, value, any pending value, the reason when the records do not settle, and any stored drawer or graph id. It does not call the model or save a memory.
 
 That sounds obvious in hindsight.
 
@@ -410,7 +430,9 @@ OLLAMA_MODEL=llama3.2:3b
 
 `TINYTALK_DEBUG` defaults to off. Set it to `1`, `true`, `yes`, or `on` to print fact-similarity scores and knowledge-graph updates. Save warnings and API errors stay visible either way. The startup line still names the provider in use.
 
-Each request stays within 24000 characters of text: the soul file, retrieved memories, recent chat, and the new message. 2000 of those characters are reserved for the reply. TinyTalk leaves out the oldest chat turns first. If that is not enough, it leaves out trailing retrieved records and says how many were omitted. A message that still cannot fit is refused, and nothing from that turn is saved. Set `TINYTALK_MAX_REQUEST_CHARS` to a positive integer to change the total. Anything else leaves 24000.
+Each request stays within 24000 characters of text: the soul file, retrieved memories, recent chat, and the new message. 2000 of those characters are reserved for the reply. That cap is a character count, not a token limit. TinyTalk leaves out the oldest chat turns first. If that is not enough, it leaves out optional retrieved records and says how many were omitted. The current profile and a pending update are not optional. If those plus the soul and the new message still cannot fit, the turn is refused and nothing is saved. Set `TINYTALK_MAX_REQUEST_CHARS` to a positive integer to change the total. Anything else leaves 24000.
+
+The profile block has its own limit of 1500 characters (`TINYTALK_PROFILE_BUDGET_CHARS`). An entry that does not fit is left out whole. TinyTalk says how many profile entries were omitted. It does not cut a value in half.
 
 Run it:
 
@@ -422,7 +444,7 @@ You'll get:
 
 ```text
 🤖 Hello! I'm your llama3.2:3b assistant, running locally. (Type 'quit' to exit)
-Type /speak to hear the last answer, /stop to stop playback, or /sources to list memories included with the last answer.
+Type /speak to hear the last answer, /stop to stop playback, /memory to show the current profile, /recall to search old conversations, or /sources to list memories included with the last answer.
 ------------------------------
 You:
 ```
@@ -455,7 +477,7 @@ You'll get:
 
 ```text
 🤖 Hello! I'm TinyTalk, using Grok through the xAI API. (Type 'quit' to exit)
-Type /speak to hear the last answer, /stop to stop playback, or /sources to list memories included with the last answer.
+Type /speak to hear the last answer, /stop to stop playback, /memory to show the current profile, /recall to search old conversations, or /sources to list memories included with the last answer.
 ------------------------------
 You:
 ```
@@ -526,9 +548,9 @@ A few of the interesting ones:
 - Llama 3.2 3B is fast and tiny, but sometimes gets weird with structured output or explanations.
 - Predicate normalization only covers relationships I've explicitly accounted for.
 - Only some facts are currently treated as single-value facts.
-- Conversation retrieval and explicit-fact retrieval still take separate paths.
+- Conversation retrieval and explicit-fact retrieval still take separate paths. Old chats come back through `/recall`. Other facts still use semantic search.
 - TinyTalk occasionally exposes too much of its internal prompt plumbing when talking about its memories.
-- The knowledge graph isn't queried during normal conversation. Previous-name questions about the test spaceship are the exception.
+- The current profile is read from the graph on ordinary turns. Previous-name questions about the test spaceship are still the only history questions. Everything else is not a timeline.
 - There is no live web research system.
 - Memory storage and graph updates aren't transactional.
 
@@ -568,10 +590,12 @@ What was my test spaceship named previously?
 
 Anything else is an ordinary question. This is not a general historical memory, and it is not a timeline.
 
+- [x] The five single-value fields are read from the graph and fact drawers on each turn, without embeddings. "What is my name?", "What is my preferred name?", and "What should you call me?" are answered from that profile. `/memory` shows it. `/recall` is how an old conversation gets back in. `/sources` adds selection and status. This is not a general historical memory.
+
 ## Next
 
 - [ ] Broader history questions, and other facts that change over time.
-- [ ] Stronger memory provenance than the `/sources` list, and tighter coordination between explicit facts, older conversations, and the graph.
+- [ ] Provenance past the current profile, including a tested `/forget` and real-world change dates.
 - [ ] Compare models on the same Soul and memories, then add more providers the same way.
 - [ ] Speech speed, streaming, and eventually voice input.
 - [ ] Version `SOUL.md`. If TinyTalk ever proposes a change to its Soul, I have to approve it first.

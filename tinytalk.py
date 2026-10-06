@@ -43,6 +43,23 @@ SINGLE_VALUE_PREDICATES = {
     "current_job",
 }
 
+# Stable order for the derived current profile. Same predicates, no new store.
+PROFILE_PREDICATES = (
+    "preferred_name",
+    "home_city",
+    "current_job",
+    "favorite_vehicle",
+    "test_spaceship_name",
+)
+PROFILE_BUDGET_CHARS = 1500
+
+# Closed set. Other name questions stay on the model plus the profile block.
+PREFERRED_NAME_QUESTIONS = {
+    "what is my name": "preferred_name",
+    "what is my preferred name": "preferred_name",
+    "what should you call me": "preferred_name",
+}
+
 # Current facts, replaced facts, facts whose update did not finish, and
 # unfinished updates that a later command for the same relationship replaced.
 FACT_ROOM = "facts"
@@ -77,11 +94,25 @@ TRIPLE_INSTRUCTIONS = (
     "If the fact is clearly about the user, set subject to user. "
     "Make predicate simple snake_case, like favorite_vehicle. "
     "Keep object short and literal. "
+    "The supported single-value predicates are preferred_name, home_city, "
+    "current_job, favorite_vehicle, and test_spaceship_name. "
     "If you are not confident there is one clear triple, "
     'return {"subject":"","predicate":"","object":""}. '
+    "A coworker's name, a ship's name, a hypothetical name, or a legal name "
+    "is not preferred_name. Use preferred_name only for the name the user "
+    "asks to be called. "
     "Reply with JSON only. "
     'Example: "my favorite vehicle is a CyberTruck" -> '
-    '{"subject":"user","predicate":"favorite_vehicle","object":"CyberTruck"}'
+    '{"subject":"user","predicate":"favorite_vehicle","object":"CyberTruck"}. '
+    'Example: "call me Willow" -> '
+    '{"subject":"user","predicate":"preferred_name","object":"Willow"}. '
+    'Example: "my preferred name is Willow" -> '
+    '{"subject":"user","predicate":"preferred_name","object":"Willow"}'
+)
+
+_SESSION_NAME = re.compile(
+    r"^(?:call me|my preferred name is)\s+(\S(?:.*\S)?)$",
+    re.IGNORECASE,
 )
 
 
@@ -128,6 +159,14 @@ def _normalize_question(text):
     for apostrophe in ("\u2019", "\u2018", "\u02bc"):
         cleaned = cleaned.replace(apostrophe, "'")
     return " ".join(cleaned.rstrip("?.!").split())
+
+
+def preferred_name_question(text):
+    """Predicate for a direct preferred-name question, or None."""
+    normalized = _normalize_question(text)
+    if normalized not in PREFERRED_NAME_QUESTIONS:
+        return None
+    return PREFERRED_NAME_QUESTIONS[normalized]
 
 
 def test_spaceship_history_question(text):
@@ -461,7 +500,8 @@ def _metadata_present(value):
     return True
 
 
-def _source(kind, text, record_id=None, filed_at=None, valid_from=None, valid_to=None):
+def _source(kind, text, record_id=None, filed_at=None, valid_from=None, valid_to=None,
+            selection=None, status=None, required=False):
     """One injected record. Missing id and time fields are omitted."""
     record = {"kind": kind, "text": text}
     if _metadata_present(record_id):
@@ -472,6 +512,12 @@ def _source(kind, text, record_id=None, filed_at=None, valid_from=None, valid_to
         record["valid_from"] = str(valid_from)
     if _metadata_present(valid_to):
         record["valid_to"] = str(valid_to)
+    if selection:
+        record["selection"] = selection
+    if status:
+        record["status"] = status
+    if required:
+        record["required"] = True
     return record
 
 
@@ -485,6 +531,12 @@ def _preview(text, limit=80):
 def render_source(source):
     """Label one record for the model without rewriting its text."""
     lines = ["[%s]" % source["kind"]]
+    if source.get("selection"):
+        lines.append("selection: %s" % source["selection"])
+    if source.get("status"):
+        lines.append("status: %s" % source["status"])
+    if source.get("predicate"):
+        lines.append("predicate: %s" % source["predicate"])
     if source.get("id"):
         lines.append("id: %s" % source["id"])
     if source.get("filed_at"):
@@ -741,6 +793,12 @@ def format_sources_report(records):
     ]
     for number, source in enumerate(records, 1):
         lines.append("%s. %s" % (number, source["kind"]))
+        if source.get("selection"):
+            lines.append("selection: %s" % source["selection"])
+        if source.get("status"):
+            lines.append("status: %s" % source["status"])
+        if source.get("predicate"):
+            lines.append("predicate: %s" % source["predicate"])
         if source.get("id"):
             lines.append("id: %s" % source["id"])
         if source.get("filed_at"):
@@ -1248,88 +1306,615 @@ def _with_sources(lead, sources, messages):
     ] + messages, sources
 
 
+def _profile_entry(predicate, state, reason=None, **fields):
+    """One derived profile field. Absent provenance stays None."""
+    entry = {
+        "predicate": predicate,
+        "value": None,
+        "state": state,
+        "source_drawer_id": None,
+        "graph_record_id": None,
+        "source_text": None,
+        "recorded_at": None,
+        "pending_value": None,
+        "pending_drawer_id": None,
+        "reason": reason,
+    }
+    for key, value in fields.items():
+        if key in entry:
+            entry[key] = value
+    return entry
+
+
+def _unavailable_profile(reason):
+    return [
+        _profile_entry(predicate, "unavailable", reason)
+        for predicate in PROFILE_PREDICATES
+    ]
+
+
+def _metadata_agrees(drawer, predicate, obj):
+    """True when stored relationship metadata names this value."""
+    metadata = (drawer or {}).get("metadata")
+    if _is_unclassified(metadata):
+        return False
+    stored, stored_obj = _fact_relationship(metadata)
+    if not stored or not stored_obj:
+        return False
+    return _canon_predicate(stored) == predicate and _names_match(stored_obj, obj)
+
+
+def _distinct_objects(links):
+    objects = []
+    for link in links or []:
+        obj = link.get("object")
+        if obj and not any(_names_match(obj, seen) for seen in objects):
+            objects.append(obj)
+    return objects
+
+
+def _drawers_by_id(memory):
+    """Full drawers keyed by id. Room comes from the listing, not the id text."""
+    found = {}
+    for room in (FACT_ROOM, PENDING_ROOM, HISTORY_ROOM, ABANDONED_ROOM):
+        for drawer in _room_drawers(memory, room):
+            item = dict(drawer)
+            item["room"] = room
+            found[item.get("drawer_id")] = item
+    return found
+
+
+def _collapse_proposals(proposals):
+    unique = []
+    for proposal in proposals:
+        if not any(_names_match(proposal["object"], have["object"]) for have in unique):
+            unique.append(proposal)
+    return unique
+
+
+def _classify_profile_predicate(memory, predicate, links, by_id):
+    """One predicate from open edges plus pending drawers. Does not search."""
+    proposals = []
+    for drawer in by_id.values():
+        if drawer.get("room") != PENDING_ROOM:
+            continue
+        stored, obj = _fact_relationship(drawer.get("metadata"))
+        if not stored or not obj or _canon_predicate(stored) != predicate:
+            continue
+        proposals.append({
+            "object": obj,
+            "drawer_id": drawer.get("drawer_id"),
+            "text": drawer.get("text") or "",
+            "filed_at": (drawer.get("metadata") or {}).get("filed_at"),
+        })
+
+    if len(_distinct_objects(links)) > 1:
+        return _profile_entry(
+            predicate, "conflict", "Several active values exist.",
+            graph_record_id=links[0].get("triple_id"),
+        )
+
+    confirmed = []
+    last_confirmed = []
+    problems = []
+    for link in links:
+        drawer_id = link.get("drawer_id")
+        if not drawer_id:
+            problems.append("The graph edge has no fact drawer.")
+            continue
+        try:
+            room = _drawer_room(memory, drawer_id)
+        except Exception:
+            return _profile_entry(
+                predicate, "unavailable", "A linked fact drawer could not be read.",
+                graph_record_id=link.get("triple_id"),
+            )
+        if room is None:
+            problems.append("The linked drawer is missing.")
+            continue
+        drawer = by_id.get(drawer_id)
+        if drawer is None or drawer.get("room") != room:
+            problems.append("The linked drawer is not in the room the store reported.")
+            continue
+        agrees = _metadata_agrees(drawer, predicate, link.get("object"))
+        record = {
+            "value": link.get("object"),
+            "source_drawer_id": drawer_id,
+            "graph_record_id": link.get("triple_id"),
+            "source_text": drawer.get("text") or "",
+            "recorded_at": (drawer.get("metadata") or {}).get("filed_at"),
+        }
+        if room == FACT_ROOM and agrees:
+            if not any(item["source_drawer_id"] == drawer_id for item in confirmed):
+                confirmed.append(record)
+            continue
+        if room == FACT_ROOM:
+            problems.append("The drawer metadata does not match the graph edge.")
+            continue
+        if room == HISTORY_ROOM and agrees:
+            last_confirmed.append(record)
+        if room in (PENDING_ROOM, HISTORY_ROOM, ABANDONED_ROOM):
+            problems.append(
+                "The graph edge points at %s, not current facts." % room
+            )
+            if room == PENDING_ROOM and agrees and link.get("object"):
+                proposals.append({
+                    "object": link.get("object"),
+                    "drawer_id": drawer_id,
+                    "text": drawer.get("text") or "",
+                    "filed_at": record["recorded_at"],
+                })
+            continue
+        problems.append("The linked drawer is not a current fact.")
+
+    if len(confirmed) > 1:
+        return _profile_entry(
+            predicate, "conflict", "Several current facts exist for this value.",
+            graph_record_id=confirmed[0].get("graph_record_id"),
+        )
+    confirmed_record = confirmed[0] if confirmed else None
+    proposals = _collapse_proposals(proposals)
+    if len(proposals) > 1:
+        return _profile_entry(
+            predicate, "conflict", "Several unfinished values exist.",
+            graph_record_id=(links[0].get("triple_id") if links else None),
+        )
+    proposal = proposals[0] if proposals else None
+
+    last = confirmed_record
+    if last is None:
+        last_values = []
+        for record in last_confirmed:
+            if not any(_names_match(record["value"], seen) for seen in last_values):
+                last_values.append(record["value"])
+        if len(last_values) == 1:
+            last = last_confirmed[0]
+
+    if proposal is not None:
+        fields = {
+            "pending_value": proposal["object"],
+            "pending_drawer_id": proposal["drawer_id"],
+            "source_drawer_id": proposal["drawer_id"],
+            "source_text": proposal["text"],
+            "recorded_at": proposal.get("filed_at"),
+        }
+        if last is not None:
+            fields["value"] = last["value"]
+            fields["graph_record_id"] = last.get("graph_record_id")
+        elif links:
+            fields["graph_record_id"] = links[0].get("triple_id")
+        return _profile_entry(
+            predicate, "pending", "An unfinished update is still pending.", **fields
+        )
+
+    if confirmed_record is not None and not problems:
+        return _profile_entry(predicate, "current", None, **confirmed_record)
+
+    if problems:
+        pointed_away = last is not None and all(
+            problem.startswith("The graph edge points at")
+            for problem in problems
+        )
+        if pointed_away:
+            return _profile_entry(
+                predicate, "pending", problems[0],
+                value=last["value"],
+                source_text=last.get("source_text"),
+                source_drawer_id=last.get("source_drawer_id"),
+                graph_record_id=last.get("graph_record_id"),
+                recorded_at=last.get("recorded_at"),
+            )
+        return _profile_entry(
+            predicate, "conflict", problems[0],
+            graph_record_id=(links[0].get("triple_id") if links else None),
+            source_drawer_id=(links[0].get("drawer_id") if links else None),
+        )
+
+    return _profile_entry(predicate, "missing", "No confirmed saved value.")
+
+
+def read_current_profile(memory):
+    """Rebuild the current profile from the graph and fact drawers.
+
+    One graph read covers every supported predicate. Embeddings are not used.
+    A missing graph or an unreadable store is unavailable, not a guess.
+    """
+    if memory is None or getattr(memory, "kg", None) is None:
+        return _unavailable_profile("The knowledge graph is unavailable.")
+    if getattr(memory, "list_drawers", None) is None or getattr(memory, "get_drawer", None) is None:
+        return _unavailable_profile("Fact drawers are unavailable.")
+    try:
+        names = {row["id"]: row["name"] for row in _graph_rows(memory.kg, "entities")}
+        rows = _graph_rows(memory.kg, "triples")
+    except Exception:
+        return _unavailable_profile("The knowledge graph could not be read.")
+    try:
+        by_id = _drawers_by_id(memory)
+    except Exception:
+        return _unavailable_profile("Fact drawers could not be read.")
+    entries = []
+    for predicate in PROFILE_PREDICATES:
+        links = _links_from_rows(names, rows, "user", predicate)
+        entries.append(_classify_profile_predicate(memory, predicate, links, by_id))
+    return entries
+
+
+def _profile_notice(entry):
+    predicate = entry["predicate"]
+    state = entry["state"]
+    reason = entry.get("reason") or ""
+    if state == "missing":
+        return "No confirmed saved %s." % predicate
+    if state == "unavailable":
+        return "The saved %s is unavailable. %s" % (predicate, reason)
+    if state == "conflict":
+        return "The saved records do not settle %s. %s" % (predicate, reason)
+    return reason or predicate
+
+
+def _pending_profile_text(entry):
+    return _unfinished_text({
+        "text": entry.get("source_text") or entry.get("pending_value") or "",
+        "predicate": entry["predicate"],
+        "last_value": entry.get("value"),
+    })
+
+
+def _profile_sources(entries, unfinished_sources):
+    """Required sources for the derived profile. Pending reuses an existing notice."""
+    unfinished_by_id = {
+        source.get("id"): source
+        for source in unfinished_sources or []
+        if source.get("id")
+    }
+    sources = []
+    for entry in entries:
+        predicate = entry["predicate"]
+        state = entry["state"]
+        if state == "current" and entry.get("source_text"):
+            source = _source(
+                "saved fact",
+                entry["source_text"],
+                entry.get("source_drawer_id"),
+                filed_at=entry.get("recorded_at"),
+                selection="profile lookup",
+                status="current",
+                required=True,
+            )
+            source["predicate"] = predicate
+            sources.append(source)
+            continue
+        if state == "pending":
+            pending_id = entry.get("pending_drawer_id") or entry.get("source_drawer_id")
+            existing = unfinished_by_id.get(pending_id) if pending_id else None
+            if existing is not None:
+                existing["required"] = True
+                existing["selection"] = "profile lookup"
+                existing["status"] = "pending"
+                existing["predicate"] = predicate
+                sources.append(existing)
+                continue
+            source = _source(
+                UNFINISHED_KIND,
+                _pending_profile_text(entry),
+                pending_id,
+                filed_at=entry.get("recorded_at"),
+                selection="profile lookup",
+                status="pending",
+                required=True,
+            )
+            source["predicate"] = predicate
+            sources.append(source)
+            continue
+        source = _source(
+            "current profile",
+            _profile_notice(entry),
+            entry.get("graph_record_id") or entry.get("source_drawer_id"),
+            selection="profile lookup",
+            status=state,
+            required=True,
+        )
+        source["predicate"] = predicate
+        sources.append(source)
+    return sources
+
+
+def profile_budget_chars():
+    """Characters for the current-profile block. A positive env value overrides it."""
+    raw = os.environ.get("TINYTALK_PROFILE_BUDGET_CHARS", "").strip()
+    if raw:
+        try:
+            value = int(raw)
+        except ValueError:
+            value = 0
+        if value > 0:
+            return value
+    return PROFILE_BUDGET_CHARS
+
+
+def _budget_profile_sources(sources):
+    """Keep whole profile entries. Say so when the budget cannot hold all of them."""
+    budget = profile_budget_chars()
+    kept = []
+    used = 0
+    omitted = 0
+    for source in sources:
+        size = len(render_source(source)) + 2
+        if used + size > budget:
+            omitted += 1
+            continue
+        kept.append(source)
+        used += size
+    if omitted:
+        note = _source(
+            "current profile",
+            "%d current-profile entries did not fit in the %d-character profile budget."
+            % (omitted, budget),
+            selection="profile lookup",
+            status="unavailable",
+            required=True,
+        )
+        kept.append(note)
+    return kept
+
+
+def _session_name_request(messages):
+    """Last unsaved 'call me' line in this chat, or None.
+
+    Remember-this commands, questions, quotes, and coworker lines do not match.
+    """
+    found = None
+    for message in messages or []:
+        if (message or {}).get("role") != "user":
+            continue
+        line = ((message or {}).get("content") or "").strip()
+        if "remember this:" in line.casefold():
+            continue
+        if "?" in line or "coworker" in line.casefold():
+            continue
+        if line[:1] in ('"', "'", "\u201c", "\u2018"):
+            continue
+        if line[-1:] in ('"', "'", "\u201d", "\u2019"):
+            continue
+        match = _SESSION_NAME.match(line)
+        if not match:
+            continue
+        name = match.group(1).strip()
+        if not name or '"' in name or "'" in name:
+            continue
+        found = name
+    return found
+
+
+def _session_name_note(name):
+    return (
+        "In this chat the user asked to be called %s. "
+        "That request is not a saved fact." % name
+    )
+
+
+def direct_profile_answer(entry, session_name=None):
+    """Short preferred-name answer from one profile entry."""
+    state = entry.get("state")
+    lines = []
+    if state == "current" and entry.get("value"):
+        lines.append("Your saved preferred name is %s." % entry["value"])
+    elif state == "pending":
+        if entry.get("value"):
+            lines.append("The last confirmed preferred name is %s." % entry["value"])
+        else:
+            lines.append("No confirmed saved preferred name.")
+        if entry.get("pending_value"):
+            lines.append(
+                "An unfinished update would change it to %s. That value is not current."
+                % entry["pending_value"]
+            )
+        else:
+            lines.append("An unfinished update is not a current preferred name.")
+    elif state == "missing":
+        lines.append("No confirmed saved preferred name.")
+    else:
+        reason = entry.get("reason") or "The saved records do not settle it."
+        lines.append("The saved records do not settle your preferred name. %s" % reason)
+    if session_name:
+        lines.append(_session_name_note(session_name))
+    return " ".join(lines)
+
+
+def _dedupe_sources(sources, earlier):
+    seen_ids = {source.get("id") for source in earlier if source.get("id")}
+    seen_text = {
+        (source.get("text") or "").strip()
+        for source in earlier
+        if (source.get("text") or "").strip()
+    }
+    kept = []
+    for source in sources:
+        text = (source.get("text") or "").strip()
+        if source.get("id") and source.get("id") in seen_ids:
+            continue
+        if text and text in seen_text:
+            continue
+        kept.append(source)
+        if source.get("id"):
+            seen_ids.add(source["id"])
+        if text:
+            seen_text.add(text)
+    return kept
+
+
+def _semantic_sources(items):
+    sources = []
+    for item in items or []:
+        if not item:
+            continue
+        source = _coerce_saved_fact(item)
+        source["selection"] = "semantic fact"
+        source["status"] = "current"
+        sources.append(source)
+    return sources
+
+
+def _profile_block(memory, messages, unfinished):
+    session_name = _session_name_request(messages)
+    if memory is None or getattr(memory, "palace", None) is None:
+        profile = []
+    else:
+        profile = _budget_profile_sources(
+            _profile_sources(read_current_profile(memory), unfinished)
+        )
+    return profile, session_name
+
+
+def _deliver_memory(lead, profile, extra, messages, session_name):
+    if session_name:
+        lead = lead + " " + _session_name_note(session_name)
+    sources = list(profile) + _dedupe_sources(extra, profile)
+    if not sources and not session_name:
+        return messages, []
+    return _with_sources(lead, sources, messages)
+
+
+def _listed_fact_sources(memory):
+    try:
+        sources = _drawer_sources(memory, "facts")
+    except Exception:
+        sources = None
+    if sources is None:
+        try:
+            sources = [
+                _coerce_saved_fact(fact)
+                for fact in (memory.list_facts() or [])
+                if fact
+            ]
+        except Exception:
+            sources = []
+    return sources or []
+
+
 def build_context(user_prompt, messages, memory):
-    """Return request messages and the records actually injected."""
+    """Return request messages and the records actually injected.
+
+    Ordinary turns read the current profile even when fact search misses.
+    Old conversations are not injected here.
+    """
     if test_spaceship_history_question(user_prompt) is not None:
         message, sources = historical_context_message(user_prompt, memory)
         return [message] + messages, sources
     if memory is None or memory.palace is None:
         return messages, []
-    unfinished, updates = unfinished_memory(memory)
+    unfinished, _updates = unfinished_memory(memory)
+    profile, session_name = _profile_block(memory, messages, unfinished)
+    pending_ids = {
+        source.get("id")
+        for source in profile
+        if source.get("status") == "pending" and source.get("id")
+    }
+    unfinished = [source for source in unfinished if source.get("id") not in pending_ids]
+    for source in unfinished:
+        source["required"] = True
     if is_memory_introspection(user_prompt):
-        sources = []
-        try:
-            sources = _drawer_sources(memory, "facts")
-            if sources is None:
-                sources = [
-                    _coerce_saved_fact(fact)
-                    for fact in (memory.list_facts() or [])
-                    if fact
-                ]
-        except Exception:
-            sources = []
-        if sources or unfinished:
-            return _with_sources(
-                "This context contains the saved facts retrieved for this request.",
-                sources + unfinished,
-                messages,
-            )
-        return messages, []
-
-    facts = []
+        extra = _listed_fact_sources(memory) + unfinished
+        return _deliver_memory(
+            "This context contains the saved facts retrieved for this request.",
+            profile, extra, messages, session_name,
+        )
     try:
         facts = memory.search_facts(user_prompt)
     except Exception:
         facts = []
-    if facts:
-        sources = [_coerce_saved_fact(item) for item in facts if item] + unfinished
-        return _with_sources(
-            "This context contains the saved facts retrieved for this request.",
-            sources,
-            messages,
-        )
+    extra = _semantic_sources(facts) + unfinished
+    return _deliver_memory(
+        "This context contains the saved facts retrieved for this request.",
+        profile, extra, messages, session_name,
+    )
 
-    found = []
+
+def _hydrate_conversation(memory, item):
+    """Full drawer text when the store can read it. Truncated previews stay opaque."""
+    if not isinstance(item, dict):
+        return item
+    drawer_id = item.get("drawer_id") or item.get("id")
+    if not drawer_id or getattr(memory, "get_drawer", None) is None:
+        return item
     try:
-        found = memory.search_conversations(user_prompt)
+        found = memory.get_drawer(drawer_id)
+    except Exception:
+        return item
+    if not isinstance(found, dict) or found.get("error") or not found.get("content"):
+        return item
+    hydrated = dict(item)
+    hydrated["text"] = found.get("content")
+    return hydrated
+
+
+def _historical_source(item):
+    source = _coerce_conversation(item)
+    source["selection"] = "explicit history recall"
+    source["status"] = "historical"
+    text = source.get("text") or ""
+    lowered = text.casefold()
+    if "user:" not in lowered or "assistant:" not in lowered:
+        source["text"] = (
+            "Opaque historical text. Speaker roles could not be recovered.\n" + text
+        )
+    return source
+
+
+def recall_context(query, messages, memory):
+    """Explicit /recall context. Excerpts stay historical."""
+    if memory is None or getattr(memory, "palace", None) is None:
+        return messages, []
+    unfinished, updates = unfinished_memory(memory)
+    profile, session_name = _profile_block(memory, messages, unfinished)
+    try:
+        found = memory.search_conversations(query)
     except Exception:
         found = []
-    # A stored "Remember this:" turn for an unfinished update would repeat
-    # that update as if it were settled. The unfinished record stands in for it.
     retired = _retired_fact_texts(memory)
-    found = [
-        item for item in found
-        if item and _keep_conversation(item)
-        and not _from_unfinished_command(item, updates)
-        and not _from_retired_command(item, retired)
-    ]
-    if found:
-        sources = [_coerce_conversation(item) for item in found] + unfinished
-        return _with_sources(
-            "This context contains excerpts retrieved for this request "
-            "from earlier conversations. "
-            "These may contain old assistant mistakes. "
-            "When memories conflict, prefer explicit factual statements "
-            "made by the user over previous assistant responses. "
-            "A Remember this command is current evidence only while that fact "
-            "is still a saved fact. An excerpt of a replaced, abandoned, "
-            "unfinished, or unclassified update does not override a saved fact.",
-            sources,
-            messages,
-        )
-    if unfinished:
-        return _with_sources(
-            "This context lists saved memory updates that did not finish.",
-            unfinished,
-            messages,
-        )
-    return messages, []
+    excerpts = []
+    for item in found:
+        if not item or not _keep_conversation(item):
+            continue
+        if _from_unfinished_command(item, updates) or _from_retired_command(item, retired):
+            continue
+        excerpts.append(_historical_source(_hydrate_conversation(memory, item)))
+    lead = (
+        "This context contains excerpts retrieved for this explicit recall. "
+        "They are historical conversation text, not current profile facts. "
+        "An old assistant statement does not set a current personal fact."
+    )
+    return _deliver_memory(lead, profile, excerpts, messages, session_name)
 
 
 def context_messages(user_prompt, messages, memory):
     """Memory is added to this request only. It is not stored in messages."""
     request_messages, _sources = build_context(user_prompt, messages, memory)
     return request_messages
+
+
+def format_memory_report(entries):
+    """Deterministic /memory view. It does not claim a complete inventory."""
+    lines = [
+        "Current profile from the saved graph and fact drawers. "
+        "This is not a complete inventory of stored conversations."
+    ]
+    if not entries:
+        lines.append("Saved memory is unavailable in this session.")
+        return "\n".join(lines)
+    for entry in entries:
+        lines.append("%s: %s" % (entry["predicate"], entry["state"]))
+        if entry.get("value"):
+            lines.append("value: %s" % entry["value"])
+        if entry.get("pending_value"):
+            lines.append("pending: %s (not current)" % entry["pending_value"])
+        if entry.get("reason"):
+            lines.append(entry["reason"])
+        if entry.get("source_drawer_id"):
+            lines.append("drawer: %s" % entry["source_drawer_id"])
+        if entry.get("graph_record_id"):
+            lines.append("graph: %s" % entry["graph_record_id"])
+    return "\n".join(lines)
 
 
 class UnsafeReplacement(Exception):
@@ -1938,13 +2523,67 @@ def fit_outgoing(soul, request_messages, sources):
         if history:
             history = _drop_oldest_turn(history)
             continue
-        if kept:
-            kept = kept[:-1]
+        if _drop_last_optional(kept):
             continue
+        if any(source.get("required") for source in kept):
+            return None
         bare = extras + [user]
         if budget >= 1 and _request_chars(soul, bare) <= budget:
             return bare, []
         return None
+
+
+def _drop_last_optional(kept):
+    """Remove the last source that the profile does not require."""
+    for index in range(len(kept) - 1, -1, -1):
+        if not kept[index].get("required"):
+            del kept[index]
+            return True
+    return False
+
+
+def _profile_entry_for(memory, predicate):
+    if memory is None or getattr(memory, "palace", None) is None:
+        return _profile_entry(
+            predicate, "unavailable", "Saved memory is unavailable in this session."
+        )
+    for entry in read_current_profile(memory):
+        if entry["predicate"] == predicate:
+            return entry
+    return _profile_entry(predicate, "missing", "No confirmed saved value.")
+
+
+def _direct_sources(entry):
+    return [
+        source for source in _profile_sources([entry], [])
+        if source.get("predicate") == entry.get("predicate")
+    ]
+
+
+def _save_turn(memory, user_prompt, response, memory_note=None):
+    if memory is None or getattr(memory, "palace", None) is None:
+        return
+    try:
+        if memory_note:
+            memory.save_exchange(user_prompt, response, memory_note)
+        else:
+            memory.save_exchange(user_prompt, response)
+    except Exception:
+        print("Warning: could not save this turn to MemPalace.")
+
+
+def _answer_from_profile(user_prompt, messages, provider, memory, sources, predicate):
+    """Deterministic preferred-name answer. The chat model is not called."""
+    entry = _profile_entry_for(memory, predicate)
+    answer = direct_profile_answer(entry, _session_name_request(messages))
+    if sources is not None:
+        sources.replace(_direct_sources(entry))
+    messages.append({"role": "assistant", "content": answer})
+    messages = messages[-(MAX_TURNS * 2):]
+    print("%s: %s" % (provider.label, answer))
+    _save_turn(memory, user_prompt, answer)
+    print("-" * 30)
+    return messages
 
 
 def handle_turn(user_prompt, messages, provider, memory, soul, sources=None):
@@ -1957,6 +2596,12 @@ def handle_turn(user_prompt, messages, provider, memory, soul, sources=None):
     messages = list(messages)
     messages.append({"role": "user", "content": user_prompt})
     messages = messages[-(MAX_TURNS * 2):]
+    if test_spaceship_history_question(user_prompt) is None:
+        predicate = preferred_name_question(user_prompt)
+        if predicate:
+            return _answer_from_profile(
+                user_prompt, messages, provider, memory, sources, predicate
+            )
     request_messages, included = build_context(user_prompt, messages, memory)
     fitted = fit_outgoing(soul, request_messages, included)
     if fitted is None:
@@ -1983,14 +2628,40 @@ def handle_turn(user_prompt, messages, provider, memory, soul, sources=None):
     result = remember_fact(user_prompt, memory, provider)
     if result is not None:
         print(result["message"])
-    if memory is not None and memory.palace is not None:
-        try:
-            if result is not None:
-                memory.save_exchange(user_prompt, response, result["message"])
-            else:
-                memory.save_exchange(user_prompt, response)
-        except Exception:
-            print("Warning: could not save this turn to MemPalace.")
+    if result is not None:
+        _save_turn(memory, user_prompt, response, result["message"])
+    else:
+        _save_turn(memory, user_prompt, response)
+    print("-" * 30)
+    return messages
+
+
+def handle_recall(query, messages, provider, memory, soul, sources=None):
+    """Answer /recall from historical excerpts. This does not write a fact."""
+    prior = list(messages)
+    messages = list(messages)
+    messages.append({"role": "user", "content": "/recall " + query})
+    messages = messages[-(MAX_TURNS * 2):]
+    request_messages, included = recall_context(query, messages, memory)
+    fitted = fit_outgoing(soul, request_messages, included)
+    if fitted is None:
+        print(
+            "That message is too long for the %d-character request limit. Nothing was saved."
+            % request_char_limit()
+        )
+        return prior
+    request_messages, included = fitted
+    try:
+        response = provider.complete(model_messages(soul, request_messages))
+    except ProviderError as exc:
+        print("%s Nothing was saved." % exc)
+        return prior
+    if sources is not None:
+        sources.replace(included)
+    messages.append({"role": "assistant", "content": response})
+    messages = messages[-(MAX_TURNS * 2):]
+    print("%s: %s" % (provider.label, response))
+    _save_turn(memory, "/recall " + query, response)
     print("-" * 30)
     return messages
 
@@ -2015,6 +2686,22 @@ def handle_user_line(user_prompt, messages, provider, memory, soul, speech, sour
     if lowered.startswith("/sources"):
         print("Use /sources to list the saved memories included with the last answer.")
         return messages
+    if lowered == "/memory":
+        if memory is None:
+            entries = _unavailable_profile("Saved memory is unavailable in this session.")
+        else:
+            entries = read_current_profile(memory)
+        print(format_memory_report(entries))
+        return messages
+    if lowered.startswith("/memory"):
+        print("Use /memory to show the current profile.")
+        return messages
+    if lowered == "/recall" or lowered.startswith("/recall "):
+        query = user_prompt.strip()[len("/recall"):].strip()
+        if not query:
+            print("Use /recall followed by what you want from earlier conversations.")
+            return messages
+        return handle_recall(query, messages, provider, memory, soul, sources)
     kind = command_kind(user_prompt)
     if kind == "speak":
         speech.speak_last(messages)
@@ -2045,6 +2732,8 @@ def main():
     print(greeting(provider))
     print(
         "Type /speak to hear the last answer, /stop to stop playback, "
+        "/memory to show the current profile, "
+        "/recall to search old conversations, "
         "or /sources to list memories included with the last answer."
     )
     print("-" * 30)

@@ -660,6 +660,13 @@ class FactReplacementTests(unittest.TestCase):
         self.assertIn("call me Sam", self.rooms()["facts-pending"])
         self.assertEqual(self.rooms()["facts"], [])
         self.assertEqual(self.memory.current_fact_objects("user", "preferred_name"), ["Al"])
+        pending_profile = next(
+            entry for entry in tinytalk.read_current_profile(self.memory)
+            if entry["predicate"] == "preferred_name"
+        )
+        self.assertEqual(pending_profile["state"], "pending")
+        self.assertEqual(pending_profile["value"], "Al")
+        self.assertEqual(pending_profile["pending_value"], "Sam")
 
         self.memory.kg.supersede = real_supersede
         provider.answers["call me Sam"] = "not json"
@@ -692,6 +699,36 @@ class FactReplacementTests(unittest.TestCase):
         self.assertIn("call me Sam", kinds(sources, "saved fact"))
         self.assertNotIn("call me Al", kinds(sources, "saved fact"))
         self.assertIn("not a current single-value fact", body)
+
+    def test_extraction_instructions_name_profile_fields_and_exclude_other_people(self):
+        instructions = tinytalk.TRIPLE_INSTRUCTIONS
+        for predicate in (
+            "preferred_name", "home_city", "current_job",
+            "favorite_vehicle", "test_spaceship_name",
+        ):
+            self.assertIn(predicate, instructions)
+        self.assertIn("call me Willow", instructions)
+        self.assertIn("my preferred name is Willow", instructions)
+        self.assertIn("coworker", instructions.casefold())
+        self.assertIn('{"subject":"","predicate":"","object":""}', instructions)
+
+    def test_a_coworker_fact_does_not_change_preferred_name(self):
+        provider = self.provider(**{
+            "call me Willow": triple("preferred_name", "Willow"),
+            "my coworker Tommi likes tea": triple("coworker_name", "Tommi", subject="coworker"),
+        })
+        self.assertEqual(remember(self.memory, provider, "call me Willow")["status"], "saved")
+
+        saved = remember(self.memory, provider, "my coworker Tommi likes tea")
+
+        self.assertNotEqual(saved["status"], "replaced")
+        profile = next(
+            entry for entry in tinytalk.read_current_profile(self.memory)
+            if entry["predicate"] == "preferred_name"
+        )
+        self.assertEqual(profile["state"], "current")
+        self.assertEqual(profile["value"], "Willow")
+        self.assertNotEqual(profile.get("pending_value"), "Tommi")
 
     def test_repeated_success_does_not_duplicate(self):
         provider = self.provider()
