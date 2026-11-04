@@ -1,5 +1,7 @@
 # TinyTalk
 
+[![CI](https://github.com/cyb3rcricket/TinyTalk/actions/workflows/ci.yml/badge.svg)](https://github.com/cyb3rcricket/TinyTalk/actions/workflows/ci.yml)
+
 TinyTalk started as me rebuilding one of my old college chatbot projects mostly because I wanted to refresh myself on some of the "under the hood" stuff.
 
 At first it was basically:
@@ -27,6 +29,10 @@ I'm deliberately trying to keep it small enough that I can still open the code a
 No giant agent framework. No 47 layers of abstraction.
 
 Just me poking at the machinery.
+
+![Real session, run locally with Ollama (llama3.2:1b). Test facts only, shown verbatim, excerpted for length.](docs/tinytalk-session.png)
+
+Real session, run locally with Ollama (llama3.2:1b). Test facts only, shown verbatim, excerpted for length.
 
 ---
 
