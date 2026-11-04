@@ -1,0 +1,308 @@
+"""Local stdio MCP server for TinyTalk memory.
+
+The tool functions take the memory and provider explicitly so tests can call
+them without speaking MCP. main opens one memory and registers thin wrappers.
+"""
+
+import io
+import os
+import sys
+from contextlib import redirect_stdout
+from pathlib import Path
+from typing import Any
+
+from mcp.server import MCPServer
+
+import memory_core
+from memory_core import (
+    ABANDONED_ROOM,
+    FACT_ROOM,
+    HISTORY_ROOM,
+    PENDING_ROOM,
+    open_memory,
+    read_current_profile,
+    remember_fact,
+)
+from provider import build_provider, load_settings
+from tinytalk import load_dotenv
+
+# save_exchange and search_conversations use this room name. There is no
+# memory_core constant for it.
+CONVERSATIONS_ROOM = "conversations"
+SOURCE_ROOMS = (FACT_ROOM, HISTORY_ROOM, PENDING_ROOM, ABANDONED_ROOM, CONVERSATIONS_ROOM)
+
+TOOL_NAMES = (
+    "search_memories",
+    "get_current_profile",
+    "save_memory",
+    "sync_thread",
+    "recall_thread",
+    "list_sources",
+)
+
+
+def _debug_off():
+    """stdout is the MCP transport. debug() prints there when this is on."""
+    os.environ["TINYTALK_DEBUG"] = ""
+
+
+def _call(fn, *args, **kwargs):
+    """Run a tool with debug off and any print sent to stderr."""
+    previous = os.environ.get("TINYTALK_DEBUG")
+    _debug_off()
+    captured = io.StringIO()
+    try:
+        with redirect_stdout(captured):
+            return fn(*args, **kwargs)
+    finally:
+        if previous is None:
+            os.environ.pop("TINYTALK_DEBUG", None)
+        else:
+            os.environ["TINYTALK_DEBUG"] = previous
+        leaked = captured.getvalue()
+        if leaked:
+            sys.stderr.write(leaked)
+            if not leaked.endswith("\n"):
+                sys.stderr.write("\n")
+
+
+def search_memories(memory, query):
+    """Profile entries first, then semantic fact hits. The two lists stay separate."""
+    profile = read_current_profile(memory)
+    if not isinstance(query, str):
+        return {
+            "profile": profile,
+            "semantic_facts": [],
+            "error": "query must be a string.",
+        }
+    try:
+        hits = [] if memory is None else memory.search_facts(query)
+    except Exception:
+        return {
+            "profile": profile,
+            "semantic_facts": [],
+            "error": "Fact search failed.",
+        }
+    semantic_facts = []
+    for hit in hits or []:
+        if not isinstance(hit, dict):
+            continue
+        semantic_facts.append({
+            "label": "semantic fact",
+            "similarity": hit.get("similarity"),
+            "text": hit.get("text") or "",
+        })
+    return {"profile": profile, "semantic_facts": semantic_facts}
+
+
+def get_current_profile(memory):
+    """The current-profile entries, as read_current_profile stored them."""
+    return read_current_profile(memory)
+
+
+def save_memory(memory, provider, text):
+    """Wrap text as a Remember this command and return remember_fact's result."""
+    if not isinstance(text, str):
+        return {"error": "text must be a string."}
+    return remember_fact("Remember this: " + text, memory, provider)
+
+
+def _message_pairs(messages):
+    """Validated (role, content) pairs, or an error result."""
+    if not isinstance(messages, list):
+        return None, {"error": "messages must be a list of {role, content} objects."}
+    parsed = []
+    for item in messages:
+        if not isinstance(item, dict):
+            return None, {"error": "messages must be a list of {role, content} objects."}
+        role = item.get("role")
+        content = item.get("content")
+        if role not in ("user", "assistant") or not isinstance(content, str):
+            return None, {
+                "error": "Each message needs role 'user' or 'assistant' and string content.",
+            }
+        parsed.append((role, content))
+    return parsed, None
+
+
+def sync_thread(memory, title, messages, source_app):
+    """Save consecutive user→assistant pairs. The first pair carries the thread note.
+
+    A message that is not part of one of those pairs is skipped, including an
+    unpaired trailing message. Invalid shapes return an error and save nothing.
+    """
+    if not isinstance(title, str) or not isinstance(source_app, str):
+        return {"error": "title and source_app must be strings."}
+    parsed, error = _message_pairs(messages)
+    if error is not None:
+        return error
+    if memory is None or getattr(memory, "save_exchange", None) is None:
+        return {"error": "Saved memory is unavailable.", "saved": 0, "skipped": 0}
+
+    note = "Thread: %s (source: %s)" % (title, source_app)
+    saved = 0
+    skipped = 0
+    index = 0
+    while index < len(parsed):
+        role, content = parsed[index]
+        nxt = parsed[index + 1] if index + 1 < len(parsed) else None
+        if role == "user" and nxt is not None and nxt[0] == "assistant":
+            memory_note = note if saved == 0 else None
+            try:
+                memory.save_exchange(content, nxt[1], memory_note=memory_note)
+            except Exception:
+                return {
+                    "error": "Could not save an exchange.",
+                    "saved": saved,
+                    "skipped": skipped,
+                }
+            saved += 1
+            index += 2
+        else:
+            skipped += 1
+            index += 1
+    return {"saved": saved, "skipped": skipped}
+
+
+def recall_thread(memory, query):
+    """Historical excerpts, filtered the same way as tinytalk.recall_context."""
+    if not isinstance(query, str):
+        return {"error": "query must be a string.", "excerpts": []}
+    if memory is None or getattr(memory, "palace", None) is None:
+        return {"excerpts": []}
+    try:
+        found = memory.search_conversations(query)
+    except Exception:
+        found = []
+    _unused, updates = memory_core.unfinished_memory(memory)
+    retired = memory_core._retired_fact_texts(memory)
+    excerpts = []
+    for item in found:
+        if not item or not memory_core._keep_conversation(item):
+            continue
+        if (
+            memory_core._from_unfinished_command(item, updates)
+            or memory_core._from_retired_command(item, retired)
+        ):
+            continue
+        hydrated = memory_core._hydrate_conversation(memory, item)
+        excerpts.append(memory_core._historical_source(hydrated))
+    return {"excerpts": excerpts}
+
+
+def _source_result(source, room):
+    """One drawer, from a memory_core source record plus the room it was found in."""
+    record = {
+        "found": True,
+        "kind": source.get("kind"),
+        "room": room,
+        "status": room,
+        "text_preview": memory_core._preview(source.get("text") or ""),
+        "id": source.get("id"),
+    }
+    if source.get("filed_at"):
+        record["filed_at"] = source["filed_at"]
+    return record
+
+
+def list_sources(memory, drawer_id):
+    """The stored source for one drawer id, looked up across the five rooms.
+
+    This is not the chat /sources list and it does not use session state.
+    No match returns a not-found result.
+    """
+    if not isinstance(drawer_id, str) or not drawer_id:
+        return {"found": False, "message": "No drawer with that id."}
+    if memory is None or getattr(memory, "list_drawers", None) is None:
+        return {"found": False, "message": "Saved memory is unavailable."}
+    try:
+        for room in SOURCE_ROOMS:
+            if room == CONVERSATIONS_ROOM:
+                for drawer in memory_core._room_drawers(memory, room):
+                    if str(drawer.get("drawer_id")) != drawer_id:
+                        continue
+                    source = memory_core._coerce_conversation({
+                        "text": drawer.get("text") or "",
+                        "drawer_id": drawer.get("drawer_id"),
+                        "metadata": drawer.get("metadata") or {},
+                    })
+                    return _source_result(source, room)
+                continue
+            sources = memory_core._drawer_sources(memory, room)
+            if sources is None:
+                return {"found": False, "message": "Saved memory is unavailable."}
+            for source in sources:
+                if source.get("id") == drawer_id:
+                    return _source_result(source, room)
+    except Exception:
+        return {"found": False, "message": "The drawer could not be read."}
+    return {"found": False, "message": "No drawer with that id."}
+
+
+def create_server(memory, provider):
+    """Register the six tools as thin wrappers. Does not open a memory."""
+    mcp = MCPServer("TinyTalk")
+
+    @mcp.tool(name="search_memories")
+    def search_memories_tool(query: str) -> dict[str, Any]:
+        """Current-profile entries first, then separate semantic fact hits."""
+        return _call(search_memories, memory, query)
+
+    @mcp.tool(name="get_current_profile")
+    def get_current_profile_tool() -> list[dict]:
+        """The five current-profile entries, unchanged."""
+        return _call(get_current_profile, memory)
+
+    @mcp.tool(name="save_memory")
+    def save_memory_tool(text: str) -> dict[str, Any]:
+        """Save text with Remember this. Returns status and message unchanged."""
+        result = _call(save_memory, memory, provider, text)
+        if result is None:
+            return {"status": None, "message": None}
+        return result
+
+    @mcp.tool(name="sync_thread")
+    def sync_thread_tool(title: str, messages: list, source_app: str) -> dict[str, Any]:
+        """Save user→assistant pairs from another app. The trailing unpaired message is skipped."""
+        return _call(sync_thread, memory, title, messages, source_app)
+
+    @mcp.tool(name="recall_thread")
+    def recall_thread_tool(query: str) -> dict[str, Any]:
+        """Historical conversation excerpts. Not current facts."""
+        return _call(recall_thread, memory, query)
+
+    @mcp.tool(name="list_sources")
+    def list_sources_tool(drawer_id: str) -> dict[str, Any]:
+        """Look up one stored drawer by id across the five memory rooms."""
+        return _call(list_sources, memory, drawer_id)
+
+    return mcp
+
+
+def main():
+    """Open one memory and serve it on stdio. Debug stays off."""
+    load_dotenv(Path(__file__).with_name(".env"))
+    _debug_off()
+    provider = None
+    try:
+        provider = build_provider(load_settings(os.environ))
+    except Exception as exc:
+        sys.stderr.write(
+            "TinyTalk MCP: provider unavailable (%s). "
+            "The server will stay up; structured fact extraction is off.\n" % exc
+        )
+        provider = None
+    captured = io.StringIO()
+    with redirect_stdout(captured):
+        memory = open_memory()
+    leaked = captured.getvalue()
+    if leaked:
+        sys.stderr.write(leaked)
+        if not leaked.endswith("\n"):
+            sys.stderr.write("\n")
+    create_server(memory, provider).run(transport="stdio")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

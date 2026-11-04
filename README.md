@@ -545,6 +545,20 @@ For now.
 
 ---
 
+## MCP server
+
+Other local clients can use the same memory over MCP. The server speaks stdio only. It does not open a port.
+
+```bash
+python mcp_server.py
+```
+
+It reads the same `.env` as the chat and opens the same MemPalace store. Provider settings are the ones TinyTalk already uses. If those settings cannot build a provider, the server still starts, and saving a memory keeps the words without a structured fact.
+
+The tools are `search_memories`, `get_current_profile`, `save_memory`, `sync_thread`, `recall_thread`, and `list_sources`.
+
+Leave `TINYTALK_DEBUG` off. stdout is the MCP transport, so a debug line is not a protocol message. The server turns debug off when it starts.
+
 # Things that are still weird
 
 This is very much an experiment, and there are some rough edges.
