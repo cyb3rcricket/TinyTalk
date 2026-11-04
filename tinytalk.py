@@ -2031,6 +2031,9 @@ def _store_drawer(memory, fact, predicate=None, obj=None, room=PENDING_ROOM):
             for drawer in _room_drawers(memory, FACT_ROOM):
                 if drawer["text"] == fact:
                     return drawer["drawer_id"], FACT_ROOM
+    except Exception:
+        return None
+    try:
         saved = memory.add_drawer(
             wing="tinytalk",
             room=target,
@@ -2038,9 +2041,12 @@ def _store_drawer(memory, fact, predicate=None, obj=None, room=PENDING_ROOM):
             source_file=source,
             added_by="tinytalk",
         )
-    except Exception:
+    except Exception as exc:
+        debug(str(exc))
         return None
     if not isinstance(saved, dict) or not saved.get("success"):
+        if isinstance(saved, dict) and saved.get("error"):
+            debug(saved["error"])
         return None
     drawer_id = saved.get("drawer_id")
     if saved.get("reason") != "already_exists" or getattr(memory, "get_drawer", None) is None:
