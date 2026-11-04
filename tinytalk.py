@@ -23,9 +23,7 @@ from memory_core import (
     TRIPLE_INSTRUCTIONS,
     _SESSION_NAME,
     snake_predicate,
-    is_memory_introspection,
     _normalize_question,
-    preferred_name_question,
     test_spaceship_history_question,
     _names_match,
     test_spaceship_fact_name,
@@ -94,20 +92,9 @@ from memory_core import (
     _profile_sources,
     profile_budget_chars,
     _budget_profile_sources,
-    _session_name_request,
-    _session_name_note,
-    direct_profile_answer,
     _dedupe_sources,
-    _semantic_sources,
-    _profile_block,
-    _deliver_memory,
-    _listed_fact_sources,
-    build_context,
     _hydrate_conversation,
     _historical_source,
-    recall_context,
-    context_messages,
-    format_memory_report,
     UnsafeReplacement,
     _status,
     _not_saved,
@@ -176,6 +163,224 @@ def load_soul():
 def model_messages(soul, request_messages):
     """Same system instructions, memory context, and history for every provider."""
     return [{"role": "system", "content": soul}] + list(request_messages)
+
+
+def is_memory_introspection(text):
+    return _normalize_question(text) in MEMORY_INTROSPECTION_QUESTIONS
+
+
+def preferred_name_question(text):
+    """Predicate for a direct preferred-name question, or None."""
+    normalized = _normalize_question(text)
+    if normalized not in PREFERRED_NAME_QUESTIONS:
+        return None
+    return PREFERRED_NAME_QUESTIONS[normalized]
+
+
+def _session_name_request(messages):
+    """Last unsaved 'call me' line in this chat, or None.
+
+    Remember-this commands, questions, quotes, and coworker lines do not match.
+    """
+    found = None
+    for message in messages or []:
+        if (message or {}).get("role") != "user":
+            continue
+        line = ((message or {}).get("content") or "").strip()
+        if "remember this:" in line.casefold():
+            continue
+        if "?" in line or "coworker" in line.casefold():
+            continue
+        if line[:1] in ('"', "'", "\u201c", "\u2018"):
+            continue
+        if line[-1:] in ('"', "'", "\u201d", "\u2019"):
+            continue
+        match = _SESSION_NAME.match(line)
+        if not match:
+            continue
+        name = match.group(1).strip()
+        if not name or '"' in name or "'" in name:
+            continue
+        found = name
+    return found
+
+
+def _session_name_note(name):
+    return (
+        "In this chat the user asked to be called %s. "
+        "That request is not a saved fact." % name
+    )
+
+
+def direct_profile_answer(entry, session_name=None):
+    """Short preferred-name answer from one profile entry."""
+    state = entry.get("state")
+    lines = []
+    if state == "current" and entry.get("value"):
+        lines.append("Your saved preferred name is %s." % entry["value"])
+    elif state == "pending":
+        if entry.get("value"):
+            lines.append("The last confirmed preferred name is %s." % entry["value"])
+        else:
+            lines.append("No confirmed saved preferred name.")
+        if entry.get("pending_value"):
+            lines.append(
+                "An unfinished update would change it to %s. That value is not current."
+                % entry["pending_value"]
+            )
+        else:
+            lines.append("An unfinished update is not a current preferred name.")
+    elif state == "missing":
+        lines.append("No confirmed saved preferred name.")
+    else:
+        reason = entry.get("reason") or "The saved records do not settle it."
+        lines.append("The saved records do not settle your preferred name. %s" % reason)
+    if session_name:
+        lines.append(_session_name_note(session_name))
+    return " ".join(lines)
+
+
+def _semantic_sources(items):
+    sources = []
+    for item in items or []:
+        if not item:
+            continue
+        source = _coerce_saved_fact(item)
+        source["selection"] = "semantic fact"
+        source["status"] = "current"
+        sources.append(source)
+    return sources
+
+
+def _profile_block(memory, messages, unfinished):
+    session_name = _session_name_request(messages)
+    if memory is None or getattr(memory, "palace", None) is None:
+        profile = []
+    else:
+        profile = _budget_profile_sources(
+            _profile_sources(read_current_profile(memory), unfinished)
+        )
+    return profile, session_name
+
+
+def _deliver_memory(lead, profile, extra, messages, session_name):
+    if session_name:
+        lead = lead + " " + _session_name_note(session_name)
+    sources = list(profile) + _dedupe_sources(extra, profile)
+    if not sources and not session_name:
+        return messages, []
+    return _with_sources(lead, sources, messages)
+
+
+def _listed_fact_sources(memory):
+    try:
+        sources = _drawer_sources(memory, "facts")
+    except Exception:
+        sources = None
+    if sources is None:
+        try:
+            sources = [
+                _coerce_saved_fact(fact)
+                for fact in (memory.list_facts() or [])
+                if fact
+            ]
+        except Exception:
+            sources = []
+    return sources or []
+
+
+def build_context(user_prompt, messages, memory):
+    """Return request messages and the records actually injected.
+
+    Ordinary turns read the current profile even when fact search misses.
+    Old conversations are not injected here.
+    """
+    if test_spaceship_history_question(user_prompt) is not None:
+        message, sources = historical_context_message(user_prompt, memory)
+        return [message] + messages, sources
+    if memory is None or memory.palace is None:
+        return messages, []
+    unfinished, _updates = unfinished_memory(memory)
+    profile, session_name = _profile_block(memory, messages, unfinished)
+    pending_ids = {
+        source.get("id")
+        for source in profile
+        if source.get("status") == "pending" and source.get("id")
+    }
+    unfinished = [source for source in unfinished if source.get("id") not in pending_ids]
+    for source in unfinished:
+        source["required"] = True
+    if is_memory_introspection(user_prompt):
+        extra = _listed_fact_sources(memory) + unfinished
+        return _deliver_memory(
+            "This context contains the saved facts retrieved for this request.",
+            profile, extra, messages, session_name,
+        )
+    try:
+        facts = memory.search_facts(user_prompt)
+    except Exception:
+        facts = []
+    extra = _semantic_sources(facts) + unfinished
+    return _deliver_memory(
+        "This context contains the saved facts retrieved for this request.",
+        profile, extra, messages, session_name,
+    )
+
+
+def recall_context(query, messages, memory):
+    """Explicit /recall context. Excerpts stay historical."""
+    if memory is None or getattr(memory, "palace", None) is None:
+        return messages, []
+    unfinished, updates = unfinished_memory(memory)
+    profile, session_name = _profile_block(memory, messages, unfinished)
+    try:
+        found = memory.search_conversations(query)
+    except Exception:
+        found = []
+    retired = _retired_fact_texts(memory)
+    excerpts = []
+    for item in found:
+        if not item or not _keep_conversation(item):
+            continue
+        if _from_unfinished_command(item, updates) or _from_retired_command(item, retired):
+            continue
+        excerpts.append(_historical_source(_hydrate_conversation(memory, item)))
+    lead = (
+        "This context contains excerpts retrieved for this explicit recall. "
+        "They are historical conversation text, not current profile facts. "
+        "An old assistant statement does not set a current personal fact."
+    )
+    return _deliver_memory(lead, profile, excerpts, messages, session_name)
+
+
+def context_messages(user_prompt, messages, memory):
+    """Memory is added to this request only. It is not stored in messages."""
+    request_messages, _sources = build_context(user_prompt, messages, memory)
+    return request_messages
+
+
+def format_memory_report(entries):
+    """Deterministic /memory view. It does not claim a complete inventory."""
+    lines = [
+        "Current profile from the saved graph and fact drawers. "
+        "This is not a complete inventory of stored conversations."
+    ]
+    if not entries:
+        lines.append("Saved memory is unavailable in this session.")
+        return "\n".join(lines)
+    for entry in entries:
+        lines.append("%s: %s" % (entry["predicate"], entry["state"]))
+        if entry.get("value"):
+            lines.append("value: %s" % entry["value"])
+        if entry.get("pending_value"):
+            lines.append("pending: %s (not current)" % entry["pending_value"])
+        if entry.get("reason"):
+            lines.append(entry["reason"])
+        if entry.get("source_drawer_id"):
+            lines.append("drawer: %s" % entry["source_drawer_id"])
+        if entry.get("graph_record_id"):
+            lines.append("graph: %s" % entry["graph_record_id"])
+    return "\n".join(lines)
 
 
 def request_char_limit():
