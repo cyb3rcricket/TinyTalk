@@ -81,6 +81,41 @@ TEST_SPACESHIP_HISTORY_QUESTIONS = {
     "what was my test spaceship named previously": "",
 }
 
+# Closed wordings, including literal anchors just like "before enterprise".
+# Other values and phrasings remain ordinary questions.
+PREFERRED_NAME_HISTORY_QUESTIONS = {
+    "what was my name before": "",
+    "what was my previous name": "",
+    "what was my name before willow": "willow",
+}
+HOME_CITY_HISTORY_QUESTIONS = {
+    "what was my home city before": "",
+    "what was my previous home city": "",
+    "what was my home city before nashville": "nashville",
+}
+CURRENT_JOB_HISTORY_QUESTIONS = {
+    "what was my job before": "",
+    "what was my previous job": "",
+    "what was my job before engineer": "engineer",
+}
+FAVORITE_VEHICLE_HISTORY_QUESTIONS = {
+    "what was my favorite vehicle before": "",
+    "what was my previous favorite vehicle": "",
+    "what was my favorite vehicle before cybertruck": "cybertruck",
+}
+PROFILE_HISTORY_QUESTIONS = {
+    "preferred_name": PREFERRED_NAME_HISTORY_QUESTIONS,
+    "home_city": HOME_CITY_HISTORY_QUESTIONS,
+    "current_job": CURRENT_JOB_HISTORY_QUESTIONS,
+    "favorite_vehicle": FAVORITE_VEHICLE_HISTORY_QUESTIONS,
+}
+HISTORY_LABELS = {
+    "preferred_name": "preferred name",
+    "home_city": "home city",
+    "current_job": "job",
+    "favorite_vehicle": "favorite vehicle",
+}
+
 _TEST_SPACESHIP_NAME = re.compile(
     r"\btest spaceship is (?:named|called)\s+([^.\n?!]+)",
     re.IGNORECASE,
@@ -149,6 +184,20 @@ def test_spaceship_history_question(text):
     return TEST_SPACESHIP_HISTORY_QUESTIONS[normalized]
 
 
+def profile_history_question(text):
+    """Return (predicate, later value) for a closed history wording, or None."""
+    normalized = _normalize_question(text)
+    if normalized in PREFERRED_NAME_QUESTIONS or normalized in MEMORY_INTROSPECTION_QUESTIONS:
+        return None
+    later_name = test_spaceship_history_question(text)
+    if later_name is not None:
+        return "test_spaceship_name", later_name
+    for predicate, questions in PROFILE_HISTORY_QUESTIONS.items():
+        if normalized in questions:
+            return predicate, questions[normalized]
+    return None
+
+
 def _names_match(left, right):
     return (left or "").strip().casefold() == (right or "").strip().casefold()
 
@@ -182,7 +231,7 @@ def _canon_predicate(predicate):
     return PREDICATE_ALIASES.get(cleaned, cleaned)
 
 
-def _history_edges(graph_rows):
+def _history_edges(graph_rows, predicate="test_spaceship_name"):
     edges = []
     for row in graph_rows or []:
         if not isinstance(row, dict):
@@ -191,8 +240,8 @@ def _history_edges(graph_rows):
         if subject not in (None, "", "user"):
             continue
         stored = row.get("predicate") or ""
-        predicate = _canon_predicate(stored)
-        if predicate != "test_spaceship_name":
+        canonical = _canon_predicate(stored)
+        if canonical != predicate:
             continue
         obj = row.get("object")
         if not isinstance(obj, str) or not obj.strip():
@@ -204,7 +253,7 @@ def _history_edges(graph_rows):
         edges.append({
             "id": row.get("id"),
             "stored_predicate": stored,
-            "predicate": predicate,
+            "predicate": canonical,
             "object": obj.strip(),
             "current": current,
             "valid_from": row.get("valid_from"),
@@ -213,7 +262,7 @@ def _history_edges(graph_rows):
     return edges
 
 
-def _history_facts(drawers):
+def _history_facts(drawers, predicate="test_spaceship_name"):
     facts = []
     for item in drawers or []:
         if not isinstance(item, dict):
@@ -225,7 +274,16 @@ def _history_facts(drawers):
         if text is None:
             text = item.get("text") or ""
         text = text.strip()
-        name = test_spaceship_fact_name(text)
+        if predicate == "test_spaceship_name":
+            # Keep the legacy spaceship parser and its results unchanged.
+            name = test_spaceship_fact_name(text)
+        else:
+            stored, name = _fact_relationship(item.get("metadata") or {})
+            if _canon_predicate(stored) != predicate:
+                continue
+            if not isinstance(name, str):
+                continue
+            name = name.strip()
         if not name:
             continue
         filed_at = (item.get("metadata") or {}).get("filed_at")
@@ -315,8 +373,22 @@ def test_spaceship_history_evidence(graph_rows, drawers, later_name):
     later_name is "" for "the previous name", or the name in "before <name>".
     Retrieval order is not used as time order.
     """
-    edges = _history_edges(graph_rows)
-    facts = _history_facts(drawers)
+    return _history_evidence(_history_edges(graph_rows), _history_facts(drawers), later_name)
+
+
+def profile_history_evidence(graph_rows, drawers, predicate, later_value):
+    """Use saved relationship metadata for the four other profile fields."""
+    if predicate == "test_spaceship_name":
+        return test_spaceship_history_evidence(graph_rows, drawers, later_value)
+    if predicate not in PROFILE_HISTORY_QUESTIONS:
+        raise ValueError("Unsupported history predicate")
+    return _history_evidence(
+        _history_edges(graph_rows, predicate), _history_facts(drawers, predicate), later_value,
+    )
+
+
+def _history_evidence(edges, facts, later_name):
+    """Shared ordering rules; filing time and retrieval order do not order values."""
     current_edges = [edge for edge in edges if edge["current"]]
     inactive = [edge for edge in edges if not edge["current"]]
     current_facts = [fact for fact in facts if fact["room"] == "facts"]
@@ -455,6 +527,62 @@ def format_test_spaceship_history(evidence):
             "An inactive graph edge repeats the current name.%s "
             "It is not a previous name, and its end time is not a rename date."
             % note
+        )
+    return "\n".join(lines)
+
+
+def format_profile_history(evidence, predicate):
+    """Label earlier profile values as historical, with no inferred change date."""
+    if predicate == "test_spaceship_name":
+        return format_test_spaceship_history(evidence)
+    label = HISTORY_LABELS[predicate]
+    current = evidence["current_name"]
+    previous = evidence["previous_name"]
+    lines = ["Current %s: %s" % (label, current or "not established")]
+    for fact in evidence["current_facts"]:
+        if current and _names_match(fact["name"], current):
+            lines.append("Current fact: %s" % fact["text"])
+    for edge in evidence["current_edges"]:
+        if current and _names_match(edge["object"], current):
+            lines.append("Current graph: user -> %s -> %s" % (predicate, edge["object"]))
+    lines.append("Previous %s: %s" % (label, previous or "not established"))
+    if previous:
+        lines.append("This previous value is historical, not current.")
+        for fact in evidence["archived"]:
+            if _names_match(fact["name"], previous):
+                lines.append("Archived fact: %s" % fact["text"])
+        for edge in evidence["history_edges"]:
+            if _names_match(edge["object"], previous):
+                lines.append(
+                    "Inactive graph edge: user -> %s -> %s" % (predicate, edge["object"])
+                )
+        lines.append(
+            "Tell the user the previous %s was %s. Do not give a change date."
+            % (label, previous)
+        )
+    else:
+        if evidence["requested_mismatch"]:
+            lines.append("The question asks about a value that is not the current saved %s." % label)
+        elif evidence["candidate_count"] > 1:
+            lines.append(
+                "More than one earlier value is saved, and the stored times do not "
+                "establish which value came immediately before."
+            )
+        elif evidence["candidate_count"] == 1:
+            lines.append(
+                "An earlier record is saved, but its stored time does not establish "
+                "it as the previous value."
+            )
+        else:
+            lines.append("The saved records do not include an earlier %s." % label)
+        lines.append(
+            "Tell the user that the saved records do not establish a previous %s. "
+            "Do not guess a value or a date." % label
+        )
+    if evidence["duplicates"]:
+        lines.append(
+            "An inactive graph edge repeats the current value. It is not a previous "
+            "value, and its end time is not a change date."
         )
     return "\n".join(lines)
 
@@ -811,8 +939,8 @@ def _load_test_spaceship_records(memory):
     return graph_rows, drawers
 
 
-def _unsettled_row(row, names):
-    if not isinstance(row, dict) or _canon_predicate(row.get("predicate")) != "test_spaceship_name":
+def _unsettled_row(row, names, predicate="test_spaceship_name"):
+    if not isinstance(row, dict) or _canon_predicate(row.get("predicate")) != predicate:
         return False
     if "current" in row and row.get("current") is not None:
         current = bool(row.get("current"))
@@ -822,6 +950,9 @@ def _unsettled_row(row, names):
 
 
 def historical_context_message(user_prompt, memory):
+    question = profile_history_question(user_prompt)
+    if question is not None and question[0] != "test_spaceship_name":
+        return _profile_historical_context_message(memory, *question)
     later_name = test_spaceship_history_question(user_prompt)
     sources = []
     unfinished, updates = unfinished_memory(memory)
@@ -870,6 +1001,52 @@ def historical_context_message(user_prompt, memory):
         ),
     }
     return message, sources
+
+
+def _profile_historical_context_message(memory, predicate, later_value):
+    """The same history read and source path, scoped to one profile predicate."""
+    label = HISTORY_LABELS[predicate]
+    unfinished, updates = unfinished_memory(memory)
+    relevant = [
+        (source, update) for source, update in zip(unfinished, updates)
+        if update.get("predicate") == predicate
+    ]
+    unfinished = [source for source, _update in relevant]
+    unsettled = [
+        update.get("object") for _source, update in relevant
+        if not _names_match(update.get("object"), update.get("last_value"))
+    ]
+    try:
+        graph_rows, drawers = _load_test_spaceship_records(memory)
+        graph_rows = [row for row in graph_rows if not _unsettled_row(row, unsettled, predicate)]
+        evidence = profile_history_evidence(graph_rows, drawers, predicate, later_value)
+        body = format_profile_history(evidence, predicate)
+        sources = history_sources(evidence)
+    except Exception:
+        body = (
+            "Previous %s: not established\n"
+            "Tell the user that the saved records do not establish a previous %s. "
+            "Do not guess a value or a date." % (label, label)
+        )
+        sources = []
+    if unfinished:
+        body += "\n" + "\n".join(
+            "Unfinished update, not the current value: %s" % source["text"]
+            for source in unfinished
+        )
+        sources += unfinished
+    if sources:
+        body += "\n\nRetrieved sources:\n\n" + render_sources(sources)
+    return {
+        "role": "system",
+        "content": (
+            "This context is the saved %s history for this question. "
+            "Answer only from these labels. "
+            "These are retrieved sources, not information learned during model training. "
+            "Do not mention a fact that is not written here. "
+            "Do not give a change date.\n\n%s" % (label, body)
+        ),
+    }, sources
 
 
 def debug_enabled():
