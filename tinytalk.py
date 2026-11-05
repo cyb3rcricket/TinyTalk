@@ -11,6 +11,8 @@ from memory_core import (
     MEMORY_INTROSPECTION_QUESTIONS,
     SINGLE_VALUE_PREDICATES,
     PROFILE_PREDICATES,
+    FORGET_USAGE,
+    forget_profile_field,
     PROFILE_BUDGET_CHARS,
     PREFERRED_NAME_QUESTIONS,
     FACT_ROOM,
@@ -654,6 +656,13 @@ def handle_user_line(user_prompt, messages, provider, memory, soul, speech, sour
         return messages
     if lowered.startswith("/memory"):
         print("Use /memory to show the current profile.")
+        return messages
+    if lowered.startswith("/forget"):
+        parts = lowered.split()
+        if len(parts) != 2 or parts[0] != "/forget" or parts[1] not in PROFILE_PREDICATES:
+            print(FORGET_USAGE)
+            return messages
+        print(forget_profile_field(memory, parts[1])["message"])
         return messages
     if lowered == "/recall" or lowered.startswith("/recall "):
         query = user_prompt.strip()[len("/recall"):].strip()

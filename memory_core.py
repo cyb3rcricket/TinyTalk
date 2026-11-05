@@ -50,6 +50,8 @@ PROFILE_PREDICATES = (
     "test_spaceship_name",
 )
 PROFILE_BUDGET_CHARS = 1500
+FORGET_USAGE = "Use /forget <predicate>: %s." % ", ".join(PROFILE_PREDICATES)
+FORGET_SCOPE = "/forget forgets facts, it does not rewrite conversation history."
 
 # Closed set. Other name questions stay on the model plus the profile block.
 PREFERRED_NAME_QUESTIONS = {
@@ -936,6 +938,9 @@ def _load_test_spaceship_records(memory):
                 "metadata": metadata,
                 "filed_at": metadata.get("filed_at"),
             })
+    filter_rows = getattr(memory, "filter_history_graph", None)
+    if filter_rows is not None:
+        graph_rows = filter_rows(graph_rows, drawers)
     return graph_rows, drawers
 
 
@@ -1193,6 +1198,50 @@ class MemoryStore(object):
         """
         names = {row["id"]: row["name"] for row in _graph_rows(self.kg, "entities")}
         return _links_from_rows(names, _graph_rows(self.kg, "triples"), subject, predicate)
+
+    def filter_history_graph(self, graph_rows, drawers):
+        """Abandoned facts cannot return through inactive graph evidence.
+
+        query_entity omits drawer links. Match its rows to the stored triples
+        for provenance, retaining the existing query's shape and ordering.
+        Legacy unlinked rows use matching relationship metadata (or the
+        existing test-spaceship parser), never a new text parser.
+        """
+        abandoned = _room_drawers(self, ABANDONED_ROOM)
+        if not abandoned:
+            return graph_rows
+        abandoned_ids = {drawer["drawer_id"] for drawer in abandoned}
+        retired = []
+        for drawer in abandoned:
+            predicate, value = _fact_relationship(drawer["metadata"])
+            if not predicate:
+                value = test_spaceship_fact_name(drawer["text"])
+                predicate = "test_spaceship_name" if value else None
+            if predicate and value:
+                retired.append((_canon_predicate(predicate), value))
+        names = {row["id"]: row["name"] for row in _graph_rows(self.kg, "entities")}
+        triples = _graph_rows(self.kg, "triples")
+        kept = []
+        for row in graph_rows:
+            predicate = _canon_predicate(row.get("predicate"))
+            value = row.get("object")
+            matches = [
+                triple for triple in triples
+                if (names.get(triple.get("subject")) or "").casefold() == "user"
+                and triple.get("predicate") == row.get("predicate")
+                and _names_match(names.get(triple.get("object")), value)
+                and triple.get("valid_from") == row.get("valid_from")
+                and triple.get("valid_to") == row.get("valid_to")
+            ]
+            if matches and all(t.get("source_drawer_id") in abandoned_ids for t in matches):
+                continue
+            unlinked = not matches or any(not t.get("source_drawer_id") for t in matches)
+            if unlinked and any(p == predicate and _names_match(v, value) for p, v in retired):
+                live = _history_facts(drawers, predicate)
+                if not any(_names_match(fact["name"], value) for fact in live):
+                    continue
+            kept.append(row)
+        return kept
 
     def pending_facts(self):
         """Facts whose "Remember this:" update did not finish. Raises if they cannot be listed."""
@@ -2290,6 +2339,90 @@ def _save_single_value(memory, fact, triple):
     if room == FACT_ROOM and links and not [u for u in stale if u["drawer_id"] != drawer_id]:
         return _status("already_saved", "Memory: already saved.")
     return _status("saved", "Memory: saved.")
+
+
+def forget_profile_field(memory, predicate):
+    """Abandon one profile field's drawers and close its current graph edges.
+
+    Pending drawers also leave recall so the resolver can report missing.
+    Writes stop on the first failure; the summary reports completed moves,
+    not a transaction or a deletion. Repeat the command to finish.
+    """
+    moved = {room: 0 for room in (FACT_ROOM, HISTORY_ROOM, PENDING_ROOM)}
+
+    def result(status, detail):
+        return {
+            "status": status, "moved": dict(moved),
+            "message": "%s %s" % (detail, FORGET_SCOPE),
+        }
+
+    def counts():
+        return "Moved to facts-abandoned: %s." % ", ".join(
+            "%s=%s" % (room, count) for room, count in moved.items()
+        )
+
+    if predicate not in PROFILE_PREDICATES:
+        return {"status": "invalid_field", "message": FORGET_USAGE, "moved": moved}
+    if (memory is None or getattr(memory, "palace", None) is None
+            or getattr(memory, "kg", None) is None
+            or not callable(getattr(memory.kg, "invalidate", None))):
+        return result("unavailable", "Could not forget %s: saved memory or its graph is unavailable." % predicate)
+    try:
+        drawers = _drawers_by_id(memory)
+        names = {row["id"]: row["name"] for row in _graph_rows(memory.kg, "entities")}
+        rows = _graph_rows(memory.kg, "triples")
+        links = _links_from_rows(names, rows, "user", predicate)
+        own_rows = [
+            row for row in rows
+            if (names.get(row.get("subject")) or "").casefold() == "user"
+            and _canon_predicate(row.get("predicate")) == predicate
+        ]
+        linked_ids = {row.get("source_drawer_id") for row in own_rows if row.get("source_drawer_id")}
+        targets = []
+        for drawer_id, drawer in drawers.items():
+            if drawer["room"] not in moved:
+                continue
+            stored, _obj = _fact_relationship(drawer.get("metadata"))
+            matches = stored and _canon_predicate(stored) == predicate
+            if not stored:
+                matches = drawer_id in linked_ids or (
+                    predicate == "test_spaceship_name" and test_spaceship_fact_name(drawer["text"])
+                )
+            if not matches:
+                if drawer_id in linked_ids:
+                    raise UnsafeReplacement("a linked drawer belongs to another field")
+                continue
+            if any(
+                row.get("source_drawer_id") == drawer_id
+                and _canon_predicate(row.get("predicate")) != predicate
+                for row in rows
+            ):
+                raise UnsafeReplacement("a fact drawer is shared with another field")
+            targets.append(drawer)
+    except Exception:
+        return result("incomplete", "Could not safely read the facts and graph for %s. Nothing was changed." % predicate)
+    if not targets and not links:
+        return result("nothing_stored", "Nothing stored for %s." % predicate)
+    for drawer in targets:
+        if not _move_drawer(memory, drawer["drawer_id"], ABANDONED_ROOM):
+            return result("incomplete", "Could not finish forgetting %s. %s Repeat /forget %s to finish." % (
+                predicate, counts(), predicate,
+            ))
+        moved[drawer["room"]] += 1
+    try:
+        ended = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        for link in links:
+            memory.kg.invalidate("user", link["stored_predicate"], link["object"], ended=ended)
+        if memory.current_links("user", predicate):
+            raise RuntimeError("current graph edges remain")
+        entry = next(item for item in read_current_profile(memory) if item["predicate"] == predicate)
+        if entry["state"] != "missing":
+            raise RuntimeError("the profile is not missing")
+    except Exception:
+        return result("incomplete", "Could not finish forgetting %s. %s Repeat /forget %s to finish." % (
+            predicate, counts(), predicate,
+        ))
+    return result("forgotten", "Forgot facts for %s. %s" % (predicate, counts()))
 
 
 def remember_fact(user_prompt, memory, provider):
