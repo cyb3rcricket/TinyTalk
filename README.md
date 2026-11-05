@@ -417,6 +417,13 @@ cp .env.example .env
 
 TinyTalk reads `.env` on startup and does not override variables you already exported. You can also export the variables yourself and skip the file.
 
+**First run**
+
+The first command that touches memory downloads the local embedding model (`all-MiniLM-L6-v2`) once, about 167 MB.
+That first run needs an internet connection and takes longer.
+Chroma caches the model under your home directory at `~/.cache/chroma/onnx_models/all-MiniLM-L6-v2/`.
+After that download, memory works offline.
+
 ## Ollama (the default)
 
 Pull the model:
