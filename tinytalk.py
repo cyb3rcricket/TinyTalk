@@ -25,6 +25,7 @@ from memory_core import (
     snake_predicate,
     _normalize_question,
     test_spaceship_history_question,
+    profile_history_question,
     _names_match,
     test_spaceship_fact_name,
     _instant,
@@ -295,7 +296,7 @@ def build_context(user_prompt, messages, memory):
     Ordinary turns read the current profile even when fact search misses.
     Old conversations are not injected here.
     """
-    if test_spaceship_history_question(user_prompt) is not None:
+    if profile_history_question(user_prompt) is not None:
         message, sources = historical_context_message(user_prompt, memory)
         return [message] + messages, sources
     if memory is None or memory.palace is None:
@@ -554,7 +555,7 @@ def handle_turn(user_prompt, messages, provider, memory, soul, sources=None):
     messages = list(messages)
     messages.append({"role": "user", "content": user_prompt})
     messages = messages[-(MAX_TURNS * 2):]
-    if test_spaceship_history_question(user_prompt) is None:
+    if profile_history_question(user_prompt) is None:
         predicate = preferred_name_question(user_prompt)
         if predicate:
             return _answer_from_profile(
