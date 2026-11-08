@@ -424,6 +424,14 @@ That first run needs an internet connection and takes longer.
 Chroma caches the model under your home directory at `~/.cache/chroma/onnx_models/all-MiniLM-L6-v2/`.
 After that download, memory works offline.
 
+## Web interface
+
+```bash
+python gradio_app.py
+```
+
+Open `http://127.0.0.1:7861`. It uses the same provider configuration and memory as the CLI.
+
 ## Ollama (the default)
 
 Pull the model:
@@ -478,7 +486,7 @@ XAI_API_KEY=
 XAI_MODEL=grok-4.7
 ```
 
-Put the real key only in `.env` or in your shell. Do not commit it, paste it into the README, or put it in browser code. This project has no browser app.
+Put the real key only in `.env` or in your shell. Do not commit it, paste it into the README, or put it in browser code.
 
 Or, without a file:
 
