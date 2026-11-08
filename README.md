@@ -243,7 +243,7 @@ Saying the same single value again in different words does not create a second c
 
 If no relationship can be extracted on a first attempt, the words are still saved in `tinytalk/facts` and nothing in the graph is replaced. That drawer is labeled unclassified saved text: the words were kept, no relationship was confirmed, and it is not a current single-value fact. A later confirmed value does not delete those words.
 
-When the current edge has no drawer link and the new words state that same value, TinyTalk stores the fact and writes that drawer's id onto the open edge. A later change can then archive that fact. Edges saved before TinyTalk recorded that link otherwise have no such proof, and TinyTalk doesn't guess. It doesn't search for the old word or ask the model to re-read old facts. The one exception is `test_spaceship_name`: TinyTalk replaces it only when exactly one current fact parses as a test-spaceship name with the same value as the graph. That parse uses the same rule as the history questions. Any other unlinked value, such as a graph that says `New York City` next to a fact that says `I live in NYC.`, is left alone. The new words are kept as an unfinished update, and TinyTalk says so. No command moves the old records today.
+When the current edge has no drawer link and the new words state that same value, TinyTalk stores the fact and writes that drawer's id onto the open edge. A later change can then archive that fact. Edges saved before TinyTalk recorded that link otherwise have no such proof, and TinyTalk doesn't guess. It doesn't search for the old word or ask the model to re-read old facts. The one exception is `test_spaceship_name`: TinyTalk replaces it only when exactly one current fact parses as a test-spaceship name with the same value as the graph. That parse uses the same rule as the history questions. Any other unlinked value, such as a graph that says `New York City` next to a fact that says `I live in NYC.`, is left alone. The new words are kept as an unfinished update, and TinyTalk says so. The replacement path does not move those old records. `/forget <field>` is the command that retires a field's records outright.
 
 A replacement runs in this order:
 
@@ -333,7 +333,7 @@ What was the old name of my test spaceship?
 What was my test spaceship named previously?
 ```
 
-For those, it reads the current and inactive `test_spaceship_name` edges and the `tinytalk/facts` and `tinytalk/facts-history` rooms. Stored predicates pass through the same aliases as new facts. The labels name the current value and, when the records support one, the previous name. An inactive edge that repeats the current name is not a previous name. An archived test-spaceship fact fills in when the graph has no different earlier name. A separate imaginary-spaceship fact is not part of this relationship. Filing times are not used to put earlier names in order. Graph boundaries are, and TinyTalk does not turn them into a rename date. Search order is not time order. If the records do not establish one previous name, the label says that. These questions do not replace saved facts. Every other question still uses the normal fact search.
+For those, it reads the current and inactive `test_spaceship_name` edges and the `tinytalk/facts` and `tinytalk/facts-history` rooms. Stored predicates pass through the same aliases as new facts. The labels name the current value and, when the records support one, the previous name. An inactive edge that repeats the current name is not a previous name. An archived test-spaceship fact fills in when the graph has no different earlier name. A separate imaginary-spaceship fact is not part of this relationship. Filing times are not used to put earlier names in order. Graph boundaries are, and TinyTalk does not turn them into a rename date. Search order is not time order. If the records do not establish one previous name, the label says that. These questions do not replace saved facts. The other four single-value fields have their own exact wordings and work the same way. Every other question still uses the normal fact search.
 
 ---
 
@@ -585,7 +585,7 @@ A few of the interesting ones:
 - Only some facts are currently treated as single-value facts.
 - Conversation retrieval and explicit-fact retrieval still take separate paths. Old chats come back through `/recall`. Other facts still use semantic search.
 - TinyTalk occasionally exposes too much of its internal prompt plumbing when talking about its memories.
-- The current profile is read from the graph on ordinary turns. Previous-name questions about the test spaceship are still the only history questions. Everything else is not a timeline.
+- The current profile is read from the graph on ordinary turns. Previous-value questions work for the five single-value fields, each with its own exact wordings. Everything beyond those fields is not a timeline.
 - There is no live web research system.
 - Memory storage and graph updates aren't transactional.
 
@@ -612,7 +612,7 @@ It's more of a **things I want to poke at next** list.
 - [x] `imaginary_spaceship_name` stays its own predicate. It no longer replaces `test_spaceship_name`.
 - [x] Retrieved facts, conversations, archived facts, and graph records carry source labels and any metadata already stored. `/sources` lists the records included with the last successful answer. It makes no model call and saves no memory. Record dates are not presented as real-world change dates. The list shows supplied sources; it does not prove which sources the model used. Live Grok checks passed: Enterprise is current, Serenity is the previous test-spaceship name, and Picklewagon is excluded from that historical context.
 
-Only these wordings count as that history. "My spaceship" without "test" does not:
+Only these wordings count as the test spaceship's history. "My spaceship" without "test" does not:
 
 ```text
 What was my test spaceship called before Enterprise?
@@ -623,14 +623,19 @@ What was the old name of my test spaceship?
 What was my test spaceship named previously?
 ```
 
-Anything else is an ordinary question. This is not a general historical memory, and it is not a timeline.
+Anything else for this field is an ordinary question. The other four single-value fields have their own wordings, in the same style. Beyond the five fields, this is not a general historical memory, and it is not a timeline.
 
-- [x] The five single-value fields are read from the graph and fact drawers on each turn, without embeddings. "What is my name?", "What is my preferred name?", and "What should you call me?" are answered from that profile. `/memory` shows it. `/recall` is how an old conversation gets back in. `/sources` adds selection and status. This is not a general historical memory.
+- [x] The five single-value fields are read from the graph and fact drawers on each turn, without embeddings. "What is my name?", "What is my preferred name?", and "What should you call me?" are answered from that profile. `/memory` shows it. `/recall` is how an old conversation gets back in. `/sources` adds selection and status. Previous-value questions for these fields work with the wordings described above.
+- [x] Previous-value questions work for all five single-value fields, not just the test spaceship. Each field has generic wordings (asking what the field was before it changed) plus one wording anchored to a specific earlier value.
+- [x] `/forget <field>` retires one of the five profile fields. Every drawer for that field in `facts`, `facts-history`, and `facts-pending` moves to `facts-abandoned`, and the command reports what moved. Nothing is hard-deleted, it refuses when a drawer is shared, and the field can be saved again afterwards.
+- [x] The memory layer lives in `memory_core.py`, separate from the chat layer in `tinytalk.py`. `mcp_server.py` exposes it to other tools over MCP (stdio) with six tools: `search_memories`, `get_current_profile`, `save_memory`, `sync_thread`, `recall_thread`, and `list_sources`.
+- [x] `scripts/dream_pass.py` is an offline consolidation check. Its report lists duplicate fact clusters, stale echoes of profile values, and orphaned as-written facts, and it writes nothing. A separate apply mode retires only the drawer ids a human lists in an approvals file, moving them to `facts-abandoned`.
+- [x] A local web interface (`gradio_app.py`) runs the same chat, commands, provider configuration, and memory in a browser. See "Web interface" above.
 
 ## Next
 
-- [ ] Broader history questions, and other facts that change over time.
-- [ ] Provenance past the current profile, including a tested `/forget` and real-world change dates.
+- [ ] History questions for facts beyond the five single-value fields, and other facts that change over time.
+- [ ] Provenance past the current profile, including real-world change dates.
 - [ ] Compare models on the same Soul and memories, then add more providers the same way.
 - [ ] Speech speed, streaming, and eventually voice input.
 - [ ] Version `SOUL.md`. If TinyTalk ever proposes a change to its Soul, I have to approve it first.
