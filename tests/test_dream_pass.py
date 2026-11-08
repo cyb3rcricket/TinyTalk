@@ -395,3 +395,55 @@ class DreamPassTests(unittest.TestCase):
         rooms = snapshot(self.memory)
         self.assertEqual(rooms[first_id], "facts")
         self.assertEqual(rooms[second_id], "facts-abandoned")
+
+    def test_graph_linked_additive_facts_are_not_orphans(self):
+        dune = "my favorite book is Dune"
+        dune_again = "my favorite book is Dune."
+        written = "the porch light stays on until midnight"
+        first = remember(self.memory, dune, triple("favorite_book", "Dune"))
+        second = remember(self.memory, dune_again, triple("favorite_book", "Dune."))
+        as_written = remember(self.memory, written, "not a fact")
+        self.assertEqual(first["status"], "saved")
+        self.assertEqual(second["status"], "saved")
+        self.assertEqual(as_written["status"], "saved_as_written")
+
+        dune_drawer = self._drawer(dune)
+        again_drawer = self._drawer(dune_again)
+        written_drawer = self._drawer(written)
+        self.assertEqual(
+            memory_core._fact_relationship(dune_drawer["metadata"]), (None, None)
+        )
+        self.assertEqual(
+            memory_core._fact_relationship(again_drawer["metadata"]), (None, None)
+        )
+        linked = {
+            row.get("source_drawer_id")
+            for row in memory_core._graph_rows(self.memory.kg, "triples")
+        }
+        self.assertIn(dune_drawer["drawer_id"], linked)
+        self.assertIn(again_drawer["drawer_id"], linked)
+        self.assertNotIn(written_drawer["drawer_id"], linked)
+
+        before = snapshot(self.memory)
+        orphans = dream_pass.find_orphaned_as_written(self.memory)
+        clusters = dream_pass.find_duplicate_clusters(self.memory)
+        report = dream_pass.render_report(self.memory)
+        self.assertEqual(snapshot(self.memory), before)
+
+        self.assertEqual(
+            {orphan["drawer_id"] for orphan in orphans},
+            {written_drawer["drawer_id"]},
+        )
+        self.assertEqual(orphans[0]["text"], written)
+        book_clusters = [
+            cluster for cluster in clusters
+            if {member["text"] for member in cluster["members"]} == {dune, dune_again}
+        ]
+        self.assertEqual(len(book_clusters), 1)
+        orphan_section = section(report, "Orphaned as-written facts")
+        duplicate_section = section(report, "Duplicate clusters")
+        self.assertIn(written_drawer["drawer_id"], orphan_section)
+        self.assertNotIn(dune_drawer["drawer_id"], orphan_section)
+        self.assertNotIn(again_drawer["drawer_id"], orphan_section)
+        self.assertIn(dune, duplicate_section)
+        self.assertIn(dune_again, duplicate_section)

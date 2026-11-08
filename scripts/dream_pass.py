@@ -10,7 +10,8 @@ hits at DUPLICATE_SIMILARITY or above. The suggested keeper is the latest
 filed_at, then the longest text. Stale echoes are facts whose metadata names
 a profile predicate and an object other than the current profile value. They
 are reported and are not cleanup candidates. Orphaned as-written facts are
-facts-room drawers with no relationship predicate in metadata.
+facts-room drawers with no relationship predicate in metadata and no graph
+triple sourced from the drawer.
 
 search_facts returns at most three hits. A duplicate past that cutoff is missed.
 """
@@ -34,6 +35,7 @@ from memory_core import (
     _canon_predicate,
     _drawers_by_id,
     _fact_relationship,
+    _graph_rows,
     _move_drawer,
     _names_match,
     _room_drawers,
@@ -46,6 +48,10 @@ from memory_core import (
 DUPLICATE_SIMILARITY = 0.90
 
 _MOVABLE_ROOMS = (FACT_ROOM, HISTORY_ROOM)
+
+
+class GraphReadError(Exception):
+    """Graph triples could not be read, so a dream-pass report would be wrong."""
 
 
 def _call_quietly(function, *args):
@@ -219,15 +225,33 @@ def find_stale_echoes(memory):
     return echoes
 
 
+def _linked_drawer_ids(memory):
+    """Drawer ids named by a graph triple. Raises GraphReadError if unread."""
+    try:
+        rows = _graph_rows(getattr(memory, "kg", None), "triples")
+        return {
+            row.get("source_drawer_id")
+            for row in rows
+            if row.get("source_drawer_id")
+        }
+    except Exception as exc:
+        raise GraphReadError(
+            "Could not read graph triples (%s), so no dream-pass report was produced."
+            % type(exc).__name__
+        ) from exc
+
+
 def find_orphaned_as_written(memory):
-    """Facts-room drawers with no relationship predicate in metadata."""
+    """Facts-room drawers with no metadata predicate and no sourced graph triple."""
+    linked = _linked_drawer_ids(memory)
     orphans = []
     for drawer in _room_drawers(memory, FACT_ROOM):
         predicate, _obj = _relationship(drawer)
-        if predicate:
+        drawer_id = drawer.get("drawer_id")
+        if predicate or drawer_id in linked:
             continue
         orphans.append({
-            "drawer_id": drawer.get("drawer_id"),
+            "drawer_id": drawer_id,
             "text": drawer.get("text") or "",
         })
     orphans.sort(key=lambda orphan: orphan["drawer_id"] or "")
@@ -432,7 +456,11 @@ def main(argv=None, memory=None):
         for line in lines:
             print(line)
         return 0 if ok else 1
-    report = render_report(memory)
+    try:
+        report = render_report(memory)
+    except GraphReadError as exc:
+        sys.stderr.write("%s\n" % exc)
+        return 1
     if args.out:
         try:
             Path(args.out).write_text(report, encoding="utf-8")
