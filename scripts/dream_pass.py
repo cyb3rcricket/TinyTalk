@@ -349,12 +349,13 @@ def parse_approvals(text):
     return ids
 
 
-def _apply_one(memory, drawer_id):
+def _apply_one(memory, drawer_id, drawers=None):
     """One approval. Returns (line, move_failed). A refusal is not a failure."""
-    try:
-        drawers = _drawers_by_id(memory)
-    except Exception:
-        return ("FAILED %s: could not read drawers" % drawer_id, True)
+    if drawers is None:
+        try:
+            drawers = _drawers_by_id(memory)
+        except Exception:
+            return ("FAILED %s: could not read drawers" % drawer_id, True)
     drawer = drawers.get(drawer_id)
     if drawer is None:
         return ("REFUSED %s: unknown drawer" % drawer_id, False)
@@ -369,6 +370,7 @@ def _apply_one(memory, drawer_id):
     if predicate:
         return ("REFUSED %s: profile predicate %s" % (drawer_id, predicate), False)
     if _move_drawer(memory, drawer_id, ABANDONED_ROOM):
+        drawer["room"] = ABANDONED_ROOM
         return (
             "%s %s moved to %s" % (drawer_id, room, ABANDONED_ROOM),
             False,
@@ -382,8 +384,14 @@ def _apply_one(memory, drawer_id):
 def _apply_ids(memory, drawer_ids):
     lines = []
     ok = True
+    try:
+        drawers = _drawers_by_id(memory)
+    except Exception:
+        for drawer_id in drawer_ids:
+            lines.append("FAILED %s: could not read drawers" % drawer_id)
+        return lines, not drawer_ids
     for drawer_id in drawer_ids:
-        line, failed = _apply_one(memory, drawer_id)
+        line, failed = _apply_one(memory, drawer_id, drawers=drawers)
         lines.append(line)
         if failed:
             ok = False

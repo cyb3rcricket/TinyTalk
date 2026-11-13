@@ -5,6 +5,7 @@ read XAI_API_KEY, does not retry, and does not call the chat provider.
 """
 
 import os
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -163,6 +164,8 @@ class Afplay(object):
     def play(self, wav_bytes, still_current):
         if not still_current():
             return False
+        if self._popen is subprocess.Popen and shutil.which("afplay") is None:
+            raise FileNotFoundError("afplay is not available on this system.")
         fd, path = tempfile.mkstemp(prefix="tinytalk-speech-", suffix=".wav")
         try:
             os.write(fd, wav_bytes)

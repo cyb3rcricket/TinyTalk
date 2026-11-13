@@ -329,6 +329,57 @@ class McpToolTests(unittest.TestCase):
         self.assertTrue(payload["semantic_facts"])
         self.assertEqual(payload["semantic_facts"][0]["label"], "semantic fact")
 
+    def test_list_sources_uses_get_drawer_without_scanning_rooms(self):
+        mcp_server.save_memory(
+            self.memory,
+            Extractor(triple("preferred_name", "Al")),
+            "call me Al",
+        )
+        current = memory_core._room_drawers(self.memory, "facts")
+        drawer_id = current[0]["drawer_id"]
+
+        def fail_list_drawers(**kwargs):
+            raise AssertionError("list_drawers should not be called when get_drawer exists")
+
+        original_list_drawers = self.memory.list_drawers
+        self.memory.list_drawers = fail_list_drawers
+        try:
+            found = mcp_server.list_sources(self.memory, drawer_id)
+        finally:
+            self.memory.list_drawers = original_list_drawers
+
+        self.assertTrue(found["found"])
+        self.assertEqual(found["id"], drawer_id)
+        self.assertEqual(found["room"], "facts")
+        self.assertEqual(found["kind"], "saved fact")
+
+    def test_main_closes_kg_on_exit(self):
+        from unittest.mock import patch
+
+        closed = []
+
+        class FakeKG(object):
+            def close(self):
+                closed.append(True)
+
+        class FakeMemory(object):
+            kg = FakeKG()
+
+        class FakeServer(object):
+            def run(self, transport="stdio"):
+                return None
+
+        with (
+            patch.object(mcp_server, "load_dotenv"),
+            patch.object(mcp_server, "build_provider", return_value=None),
+            patch.object(mcp_server, "open_memory", return_value=FakeMemory()),
+            patch.object(mcp_server, "create_server", return_value=FakeServer()),
+        ):
+            code = mcp_server.main()
+
+        self.assertEqual(code, 0)
+        self.assertEqual(closed, [True])
+
 
 if __name__ == "__main__":
     unittest.main()

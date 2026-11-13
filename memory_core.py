@@ -3,10 +3,12 @@
 Moved out of tinytalk without behavior changes. tinytalk re-exports these names.
 """
 
+import contextvars
 import json
 import os
 import re
 import sys
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlencode
 
@@ -1054,14 +1056,44 @@ def _profile_historical_context_message(memory, predicate, later_value):
     }, sources
 
 
+_DEBUG_OVERRIDE = contextvars.ContextVar("tinytalk_debug_override", default=None)
+_OUTPUT_OVERRIDE = contextvars.ContextVar("tinytalk_output_override", default=None)
+
+
+@contextmanager
+def scoped_io(output=None, debug=None):
+    """Thread- and task-local output/debug override without mutating os.environ or sys.stdout."""
+    out_token = _OUTPUT_OVERRIDE.set(output) if output is not None else None
+    dbg_token = _DEBUG_OVERRIDE.set(debug) if debug is not None else None
+    try:
+        yield
+    finally:
+        if dbg_token is not None:
+            _DEBUG_OVERRIDE.reset(dbg_token)
+        if out_token is not None:
+            _OUTPUT_OVERRIDE.reset(out_token)
+
+
+def emit(message):
+    """Write one line to the active output callback, or print to stdout."""
+    output = _OUTPUT_OVERRIDE.get()
+    if output is not None:
+        output(message)
+    else:
+        print(message)
+
+
 def debug_enabled():
     """TINYTALK_DEBUG is off unless set to 1, true, yes, or on."""
+    override = _DEBUG_OVERRIDE.get()
+    if override is not None:
+        return bool(override)
     return os.environ.get("TINYTALK_DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def debug(message):
     if debug_enabled():
-        print(message)
+        emit(message)
 
 
 def memory_instruction(what, body):
@@ -1081,7 +1113,10 @@ def fact_to_triple(fact, provider):
     end = raw.rfind("}")
     if start == -1 or end <= start:
         return None
-    data = json.loads(raw[start:end + 1])
+    try:
+        data = json.loads(raw[start:end + 1])
+    except json.JSONDecodeError:
+        return None
     if not isinstance(data, dict):
         return None
     subject = data.get("subject")
@@ -1090,7 +1125,7 @@ def fact_to_triple(fact, provider):
     if not all(isinstance(value, str) and value.strip() for value in (subject, predicate, obj)):
         return None
     subject = subject.strip()
-    if subject.lower() in {"i", "me", "my", "myself"}:
+    if subject.lower() in {"user", "i", "me", "my", "myself"}:
         subject = "user"
     predicate = _canon_predicate(predicate)
     obj = obj.strip()
@@ -2434,9 +2469,10 @@ def remember_fact(user_prompt, memory, provider):
     stored), not_saved, or incomplete. An incomplete update keeps its words in
     facts-pending, which recall does not treat as a current fact.
     """
-    if not user_prompt.lower().startswith("remember this:"):
+    normalized = (user_prompt or "").lstrip()
+    if not normalized.lower().startswith("remember this:"):
         return None
-    fact = user_prompt[len("remember this:"):].strip()
+    fact = normalized[len("remember this:"):].strip()
     if not fact:
         return None
     if memory is None or memory.palace is None or getattr(memory, "add_drawer", None) is None:
@@ -2451,7 +2487,7 @@ def remember_fact(user_prompt, memory, provider):
         try:
             triple = fact_to_triple(fact, provider)
         except ProviderError as exc:
-            print("Warning: could not extract a knowledge-graph triple: %s" % exc)
+            emit("Warning: could not extract a knowledge-graph triple: %s" % exc)
             triple = None
         except Exception:
             triple = None
@@ -2461,6 +2497,8 @@ def remember_fact(user_prompt, memory, provider):
                 "No clear fact could be extracted, so the knowledge graph was not updated "
                 "and nothing was replaced",
             )
+    if not callable(getattr(memory, "update_drawer", None)):
+        return _not_saved("Saved memory is unavailable in this session.")
     if triple[1] not in SINGLE_VALUE_PREDICATES:
         return _save_additive(memory, fact, triple)
     if triple[0].casefold() != "user" or triple[2].casefold() not in fact.casefold():

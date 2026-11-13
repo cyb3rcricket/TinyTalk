@@ -447,3 +447,27 @@ class DreamPassTests(unittest.TestCase):
         self.assertNotIn(again_drawer["drawer_id"], orphan_section)
         self.assertIn(dune, duplicate_section)
         self.assertIn(dune_again, duplicate_section)
+
+    def test_apply_approvals_reads_drawers_once(self):
+        first_id = add_fact(self.memory, "first cached note", predicate="cache_note", obj="one")
+        second_id = add_fact(self.memory, "second cached note", predicate="cache_note", obj="two")
+        calls = []
+        real_drawers_by_id = dream_pass._drawers_by_id
+
+        def counting_drawers_by_id(memory):
+            calls.append(True)
+            return real_drawers_by_id(memory)
+
+        with patch("dream_pass._drawers_by_id", side_effect=counting_drawers_by_id):
+            lines, ok = dream_pass.apply_approvals(
+                self.memory, [first_id, second_id, first_id, "missing-id"]
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(lines, [
+            "%s facts moved to facts-abandoned" % first_id,
+            "%s facts moved to facts-abandoned" % second_id,
+            "REFUSED %s: not in facts or facts-history (currently facts-abandoned)" % first_id,
+            "REFUSED missing-id: unknown drawer",
+        ])

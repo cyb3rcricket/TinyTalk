@@ -530,6 +530,9 @@ class RoutingAndContextTests(unittest.TestCase):
             kg = Graph()
 
             def add_drawer(self, **kwargs):
+                return {"success": True, "drawer_id": "d1"}
+
+            def update_drawer(self, drawer_id, **kwargs):
                 return {"success": True}
 
         provider = ScriptedProvider([
@@ -598,6 +601,74 @@ class RoutingAndContextTests(unittest.TestCase):
 
         empty = ScriptedProvider(['{"subject":"","predicate":"","object":""}'])
         self.assertIsNone(tinytalk.fact_to_triple("not a fact", empty))
+
+        malformed = ScriptedProvider(['{"subject":"user", bad json}'])
+        self.assertIsNone(tinytalk.fact_to_triple("bad", malformed))
+
+        capitalized = ScriptedProvider([
+            '{"subject":"User","predicate":"home_city","object":"Austin"}'
+        ])
+        self.assertEqual(
+            tinytalk.fact_to_triple("I live in Austin", capitalized),
+            ("user", "home_city", "Austin"),
+        )
+
+    def test_remember_fact_handles_leading_whitespace_none_and_missing_update_drawer(self):
+        self.assertIsNone(tinytalk.remember_fact(None, None, None))
+        result = tinytalk.remember_fact("   Remember this: my name is River", None, None)
+        self.assertEqual(result["status"], "not_saved")
+
+        class NoUpdateMemory(object):
+            palace = object()
+            kg = object()
+            calls = 0
+
+            def add_drawer(self, **kwargs):
+                self.calls += 1
+                return {"success": True}
+
+        memory = NoUpdateMemory()
+        provider = ScriptedProvider(['{"subject":"user","predicate":"favorite_color","object":"blue"}'])
+        res = tinytalk.remember_fact("Remember this: my favorite color is blue", memory, provider)
+        self.assertEqual(res["status"], "not_saved")
+        self.assertEqual(memory.calls, 0)
+
+    def test_trimmed_outgoing_history_starts_on_user_turn(self):
+        prior = []
+        for index in range(tinytalk.MAX_TURNS):
+            prior.append({"role": "user", "content": "u-%s" % index})
+            prior.append({"role": "assistant", "content": "a-%s" % index})
+        scripted = ScriptedProvider(["ok"])
+        with redirect_stdout(io.StringIO()):
+            updated = tinytalk.handle_turn("u-next", prior, scripted, RecordingMemory(), "SOUL")
+        non_system = [m for m in scripted.calls[0] if m["role"] != "system"]
+        self.assertEqual(non_system[0], {"role": "user", "content": "u-1"})
+        self.assertEqual(non_system[-1], {"role": "user", "content": "u-next"})
+        self.assertEqual(len(updated), tinytalk.MAX_TURNS * 2)
+        self.assertEqual(updated[0], {"role": "user", "content": "u-1"})
+
+    def test_request_char_limit_rejects_values_not_above_reply_reserve(self):
+        with unittest.mock.patch.dict(os.environ, {"TINYTALK_MAX_REQUEST_CHARS": "2000"}):
+            self.assertEqual(tinytalk.request_char_limit(), tinytalk.MAX_REQUEST_CHARS)
+        with unittest.mock.patch.dict(os.environ, {"TINYTALK_MAX_REQUEST_CHARS": "1000"}):
+            self.assertEqual(tinytalk.request_char_limit(), tinytalk.MAX_REQUEST_CHARS)
+
+    def test_run_repl_exits_on_quit_with_surrounding_whitespace(self):
+        player = StopPlayer()
+        speech = SpeechController(object(), player, lambda _m: None)
+        provider = ScriptedProvider(["should not be called"])
+        shown = io.StringIO()
+        with redirect_stdout(shown):
+            updated = tinytalk.run_repl(
+                provider, None, "SOUL", speech, None, lambda _p: "  quit  "
+            )
+        self.assertEqual(updated, [])
+        self.assertEqual(provider.calls, [])
+        self.assertIn("Goodbye!", shown.getvalue())
+
+    def test_session_name_request_strips_trailing_punctuation(self):
+        name = tinytalk._session_name_request([{"role": "user", "content": "Call me River."}])
+        self.assertEqual(name, "River")
 
 
 class SdkRetryTests(unittest.TestCase):

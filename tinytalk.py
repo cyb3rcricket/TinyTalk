@@ -70,6 +70,8 @@ from memory_core import (
     historical_context_message,
     debug_enabled,
     debug,
+    emit,
+    scoped_io,
     memory_instruction,
     fact_to_triple,
     MemoryStore,
@@ -201,7 +203,7 @@ def _session_name_request(messages):
         match = _SESSION_NAME.match(line)
         if not match:
             continue
-        name = match.group(1).strip()
+        name = match.group(1).strip().rstrip(".!,;:").strip()
         if not name or '"' in name or "'" in name:
             continue
         found = name
@@ -394,7 +396,7 @@ def request_char_limit():
             value = int(raw)
         except ValueError:
             value = 0
-        if value > 0:
+        if value > REPLY_RESERVE_CHARS:
             return value
     return MAX_REQUEST_CHARS
 
@@ -530,7 +532,7 @@ def _save_turn(memory, user_prompt, response, memory_note=None):
         else:
             memory.save_exchange(user_prompt, response)
     except Exception:
-        print("Warning: could not save this turn to MemPalace.")
+        emit("Warning: could not save this turn to MemPalace.")
 
 
 def _answer_from_profile(user_prompt, messages, provider, memory, sources, predicate):
@@ -541,22 +543,32 @@ def _answer_from_profile(user_prompt, messages, provider, memory, sources, predi
         sources.replace(_direct_sources(entry))
     messages.append({"role": "assistant", "content": answer})
     messages = messages[-(MAX_TURNS * 2):]
-    print("%s: %s" % (provider.label, answer))
+    emit("%s: %s" % (provider.label, answer))
     _save_turn(memory, user_prompt, answer)
-    print("-" * 30)
+    emit("-" * 30)
     return messages
 
 
-def handle_turn(user_prompt, messages, provider, memory, soul, sources=None):
+def _trim_before_user(messages):
+    """Keep at most MAX_TURNS - 1 prior pairs so outgoing history starts on a user turn."""
+    trimmed = list(messages)[-(MAX_TURNS * 2 - 1):]
+    while trimmed and trimmed[0].get("role") == "assistant":
+        trimmed = trimmed[1:]
+    return trimmed
+
+
+def handle_turn(user_prompt, messages, provider, memory, soul, sources=None, output=None, debug=None):
     """Run one user turn.
 
     On a provider failure the history is left unchanged and nothing is written
     to MemPalace. Returns the updated message list.
     """
+    if output is not None or debug is not None:
+        with scoped_io(output=output, debug=debug):
+            return handle_turn(user_prompt, messages, provider, memory, soul, sources)
     prior = list(messages)
-    messages = list(messages)
+    messages = _trim_before_user(messages)
     messages.append({"role": "user", "content": user_prompt})
-    messages = messages[-(MAX_TURNS * 2):]
     if profile_history_question(user_prompt) is None:
         predicate = preferred_name_question(user_prompt)
         if predicate:
@@ -566,7 +578,7 @@ def handle_turn(user_prompt, messages, provider, memory, soul, sources=None):
     request_messages, included = build_context(user_prompt, messages, memory)
     fitted = fit_outgoing(soul, request_messages, included)
     if fitted is None:
-        print(
+        emit(
             "That message is too long for the %d-character request limit. Nothing was saved."
             % request_char_limit()
         )
@@ -575,38 +587,40 @@ def handle_turn(user_prompt, messages, provider, memory, soul, sources=None):
     try:
         response = provider.complete(model_messages(soul, request_messages))
     except ProviderError as exc:
-        print("%s Nothing was saved." % exc)
+        emit("%s Nothing was saved." % exc)
         return prior
     if sources is not None:
         sources.replace(included)
 
     messages.append({"role": "assistant", "content": response})
     messages = messages[-(MAX_TURNS * 2):]
-    print("%s: %s" % (provider.label, response))
+    emit("%s: %s" % (provider.label, response))
     # The reply was written before the fact was stored, so this line, not the
     # reply, says what happened to the memory. The conversation record is
     # saved after that result so later recall can see the final status.
     result = remember_fact(user_prompt, memory, provider)
     if result is not None:
-        print(result["message"])
+        emit(result["message"])
     if result is not None:
         _save_turn(memory, user_prompt, response, result["message"])
     else:
         _save_turn(memory, user_prompt, response)
-    print("-" * 30)
+    emit("-" * 30)
     return messages
 
 
-def handle_recall(query, messages, provider, memory, soul, sources=None):
+def handle_recall(query, messages, provider, memory, soul, sources=None, output=None, debug=None):
     """Answer /recall from historical excerpts. This does not write a fact."""
+    if output is not None or debug is not None:
+        with scoped_io(output=output, debug=debug):
+            return handle_recall(query, messages, provider, memory, soul, sources)
     prior = list(messages)
-    messages = list(messages)
+    messages = _trim_before_user(messages)
     messages.append({"role": "user", "content": "/recall " + query})
-    messages = messages[-(MAX_TURNS * 2):]
     request_messages, included = recall_context(query, messages, memory)
     fitted = fit_outgoing(soul, request_messages, included)
     if fitted is None:
-        print(
+        emit(
             "That message is too long for the %d-character request limit. Nothing was saved."
             % request_char_limit()
         )
@@ -615,15 +629,15 @@ def handle_recall(query, messages, provider, memory, soul, sources=None):
     try:
         response = provider.complete(model_messages(soul, request_messages))
     except ProviderError as exc:
-        print("%s Nothing was saved." % exc)
+        emit("%s Nothing was saved." % exc)
         return prior
     if sources is not None:
         sources.replace(included)
     messages.append({"role": "assistant", "content": response})
     messages = messages[-(MAX_TURNS * 2):]
-    print("%s: %s" % (provider.label, response))
+    emit("%s: %s" % (provider.label, response))
     _save_turn(memory, "/recall " + query, response)
-    print("-" * 30)
+    emit("-" * 30)
     return messages
 
 
@@ -637,37 +651,52 @@ def greeting(provider):
     return "🤖 Hello! I'm your %s assistant, running locally. (Type 'quit' to exit)" % model
 
 
-def handle_user_line(user_prompt, messages, provider, memory, soul, speech, sources=None):
+def handle_user_line(
+    user_prompt,
+    messages,
+    provider,
+    memory,
+    soul,
+    speech,
+    sources=None,
+    output=None,
+    debug=None,
+):
     """Route one input line. Speech and /sources do not call the model or memory."""
+    if output is not None or debug is not None:
+        with scoped_io(output=output, debug=debug):
+            return handle_user_line(
+                user_prompt, messages, provider, memory, soul, speech, sources
+            )
     lowered = (user_prompt or "").strip().lower()
     if lowered == "/sources":
         records = sources.records if sources is not None else []
-        print(format_sources_report(records))
+        emit(format_sources_report(records))
         return messages
     if lowered.startswith("/sources"):
-        print("Use /sources to list the saved memories included with the last answer.")
+        emit("Use /sources to list the saved memories included with the last answer.")
         return messages
     if lowered == "/memory":
         if memory is None:
             entries = _unavailable_profile("Saved memory is unavailable in this session.")
         else:
             entries = read_current_profile(memory)
-        print(format_memory_report(entries))
+        emit(format_memory_report(entries))
         return messages
     if lowered.startswith("/memory"):
-        print("Use /memory to show the current profile.")
+        emit("Use /memory to show the current profile.")
         return messages
     if lowered.startswith("/forget"):
         parts = lowered.split()
         if len(parts) != 2 or parts[0] != "/forget" or parts[1] not in PROFILE_PREDICATES:
-            print(FORGET_USAGE)
+            emit(FORGET_USAGE)
             return messages
-        print(forget_profile_field(memory, parts[1])["message"])
+        emit(forget_profile_field(memory, parts[1])["message"])
         return messages
     if lowered == "/recall" or lowered.startswith("/recall "):
         query = user_prompt.strip()[len("/recall"):].strip()
         if not query:
-            print("Use /recall followed by what you want from earlier conversations.")
+            emit("Use /recall followed by what you want from earlier conversations.")
             return messages
         return handle_recall(query, messages, provider, memory, soul, sources)
     kind = command_kind(user_prompt)
@@ -678,7 +707,7 @@ def handle_user_line(user_prompt, messages, provider, memory, soul, speech, sour
         speech.stop()
         return messages
     if kind == "usage":
-        print("Use /speak to play the last answer, or /stop to stop playback.")
+        emit("Use /speak to play the last answer, or /stop to stop playback.")
         return messages
     return handle_turn(user_prompt, messages, provider, memory, soul, sources)
 
@@ -720,7 +749,7 @@ def run_repl(provider, memory, soul, speech, sources, read_line, messages=None):
             except EOFError:
                 print()
                 break
-            if user_prompt.lower() == "quit":
+            if user_prompt.strip().lower() == "quit":
                 print("Goodbye! 👋")
                 break
             messages = handle_user_line(

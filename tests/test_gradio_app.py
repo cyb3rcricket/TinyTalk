@@ -253,3 +253,47 @@ class GradioAppTests(unittest.TestCase):
                 code = gradio_app.main()
         self.assertEqual(code, 1)
         self.assertIn("Configuration error: Grok mode needs XAI_API_KEY", shown.getvalue())
+
+    def test_main_falls_back_to_default_port_on_invalid_env(self):
+        app = unittest.mock.Mock()
+        for bad in ("", "not-a-port", "0", "70000"):
+            app.launch.reset_mock()
+            with unittest.mock.patch("gradio_app.create_app", return_value=app):
+                with unittest.mock.patch.dict(os.environ, {"TINYTALK_WEB_PORT": bad}):
+                    code = gradio_app.main()
+            app.launch.assert_called_once_with(
+                share=False, server_name="127.0.0.1", server_port=7861
+            )
+            self.assertEqual(code, 0)
+
+    def test_command_bubbles_survive_subsequent_chat_turns(self):
+        provider = ScriptedProvider(["Hello again."])
+        app = self._app(provider)
+        sources = tinytalk.SessionSources()
+        chat, messages, sources, _box = _dependency(app, "submit_message").fn(
+            "/memory", [], [], sources
+        )
+        self.assertEqual(len(chat), 2)
+        self.assertEqual(chat[0]["content"], "/memory")
+        self.assertIn("Current profile", chat[1]["content"])
+
+        chat, messages, sources, _box = _dependency(app, "submit_message").fn(
+            "Hi", chat, messages, sources
+        )
+        self.assertEqual(len(chat), 4)
+        self.assertEqual(chat[0]["content"], "/memory")
+        self.assertIn("Current profile", chat[1]["content"])
+        self.assertEqual(chat[2], {"role": "user", "content": "Hi"})
+        self.assertEqual(chat[3], {"role": "assistant", "content": "Hello again."})
+
+    def test_submit_does_not_mutate_debug_env_or_leak_debug(self):
+        fact = "my home city is Austin"
+        provider = TextProvider({fact: triple("home_city", "Austin")}, reply="Noted.")
+        app = self._app(provider)
+        sources = tinytalk.SessionSources()
+        with unittest.mock.patch.dict(os.environ, {"TINYTALK_DEBUG": "1"}):
+            chat, _messages, _sources, _box = _submit(
+                app, "Remember this: " + fact, [], sources
+            )
+            self.assertEqual(os.environ["TINYTALK_DEBUG"], "1")
+        self.assertNotIn("[debug]", chat[-1]["content"])

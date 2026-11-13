@@ -41,29 +41,23 @@ TOOL_NAMES = (
 )
 
 
-def _debug_off():
-    """stdout is the MCP transport. debug() prints there when this is on."""
-    os.environ["TINYTALK_DEBUG"] = ""
+def _write_stderr(message):
+    """Write a diagnostic line to stderr so stdout stays clean for MCP."""
+    text = str(message)
+    sys.stderr.write(text)
+    if not text.endswith("\n"):
+        sys.stderr.write("\n")
 
 
 def _call(fn, *args, **kwargs):
     """Run a tool with debug off and any print sent to stderr."""
-    previous = os.environ.get("TINYTALK_DEBUG")
-    _debug_off()
     captured = io.StringIO()
-    try:
-        with redirect_stdout(captured):
-            return fn(*args, **kwargs)
-    finally:
-        if previous is None:
-            os.environ.pop("TINYTALK_DEBUG", None)
-        else:
-            os.environ["TINYTALK_DEBUG"] = previous
-        leaked = captured.getvalue()
-        if leaked:
-            sys.stderr.write(leaked)
-            if not leaked.endswith("\n"):
-                sys.stderr.write("\n")
+    with memory_core.scoped_io(output=_write_stderr, debug=False), redirect_stdout(captured):
+        result = fn(*args, **kwargs)
+    leaked = captured.getvalue()
+    if leaked:
+        _write_stderr(leaked)
+    return result
 
 
 def search_memories(memory, query):
@@ -205,6 +199,39 @@ def _source_result(source, room):
     return record
 
 
+def _source_from_drawer(drawer, drawer_id):
+    if not isinstance(drawer, dict) or drawer.get("error"):
+        return None
+    metadata = drawer.get("metadata") or {}
+    wing = drawer.get("wing") or metadata.get("wing")
+    if wing and wing != "tinytalk":
+        return None
+    room = drawer.get("room") or metadata.get("room")
+    if room not in SOURCE_ROOMS:
+        return None
+    text = drawer.get("text")
+    if text is None:
+        text = drawer.get("content") or ""
+    found_id = drawer.get("drawer_id") or drawer_id
+    if room == CONVERSATIONS_ROOM:
+        source = memory_core._coerce_conversation({
+            "text": text,
+            "drawer_id": found_id,
+            "metadata": metadata,
+        })
+        return _source_result(source, room)
+    if not text.strip():
+        return None
+    source = memory_core._coerce_saved_fact({
+        "text": text,
+        "drawer_id": found_id,
+        "room": room,
+        "metadata": metadata,
+        "filed_at": metadata.get("filed_at"),
+    })
+    return _source_result(source, room)
+
+
 def list_sources(memory, drawer_id):
     """The stored source for one drawer id, looked up across the five rooms.
 
@@ -213,7 +240,19 @@ def list_sources(memory, drawer_id):
     """
     if not isinstance(drawer_id, str) or not drawer_id:
         return {"found": False, "message": "No drawer with that id."}
-    if memory is None or getattr(memory, "list_drawers", None) is None:
+    if memory is None:
+        return {"found": False, "message": "Saved memory is unavailable."}
+    get_drawer = getattr(memory, "get_drawer", None)
+    if callable(get_drawer):
+        try:
+            drawer = get_drawer(drawer_id)
+        except Exception:
+            return {"found": False, "message": "The drawer could not be read."}
+        result = _source_from_drawer(drawer, drawer_id)
+        if result is not None:
+            return result
+        return {"found": False, "message": "No drawer with that id."}
+    if getattr(memory, "list_drawers", None) is None:
         return {"found": False, "message": "Saved memory is unavailable."}
     try:
         for room in SOURCE_ROOMS:
@@ -282,7 +321,6 @@ def create_server(memory, provider):
 def main():
     """Open one memory and serve it on stdio. Debug stays off."""
     load_dotenv(Path(__file__).with_name(".env"))
-    _debug_off()
     provider = None
     try:
         provider = build_provider(load_settings(os.environ))
@@ -293,14 +331,19 @@ def main():
         )
         provider = None
     captured = io.StringIO()
-    with redirect_stdout(captured):
+    with memory_core.scoped_io(output=_write_stderr, debug=False), redirect_stdout(captured):
         memory = open_memory()
     leaked = captured.getvalue()
     if leaked:
         sys.stderr.write(leaked)
         if not leaked.endswith("\n"):
             sys.stderr.write("\n")
-    create_server(memory, provider).run(transport="stdio")
+    try:
+        create_server(memory, provider).run(transport="stdio")
+    finally:
+        kg = getattr(memory, "kg", None)
+        if kg is not None and callable(getattr(kg, "close", None)):
+            kg.close()
     return 0
 
 

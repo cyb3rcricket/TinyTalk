@@ -1,9 +1,7 @@
 """Local Gradio UI. One turn goes through tinytalk.handle_user_line."""
 
-import io
 import os
 import sys
-from contextlib import redirect_stdout
 from pathlib import Path
 
 import gradio as gr
@@ -30,23 +28,10 @@ class NoOpSpeech(object):
 
 
 def _call_quietly(function, *args):
-    """Run function with debug off and return (result, captured stdout).
-
-    Matches the stdout capture in mcp_server and scripts/dream_pass.py.
-    The captured text is kept for the chat bubble instead of sent to stderr.
-    """
-    previous = os.environ.get("TINYTALK_DEBUG")
-    os.environ["TINYTALK_DEBUG"] = ""
-    captured = io.StringIO()
-    try:
-        with redirect_stdout(captured):
-            result = function(*args)
-    finally:
-        if previous is None:
-            os.environ.pop("TINYTALK_DEBUG", None)
-        else:
-            os.environ["TINYTALK_DEBUG"] = previous
-    return result, captured.getvalue()
+    """Run function with debug off and return (result, captured output)."""
+    lines = []
+    result = function(*args, output=lines.append, debug=False)
+    return result, "\n".join(lines) + ("\n" if lines else "")
 
 
 def _visible_messages(messages):
@@ -152,16 +137,17 @@ def create_app(provider=None, memory=None, soul=None, speech=None, sources=None)
             speech,
             sources_state,
         )
-        chat = _visible_messages(updated)
+        chat = _visible_messages(before) if chat is None else list(chat)
         assistant = _appended_assistant(before, updated)
         if assistant is not None:
             bubble = _display_reply(
                 captured, assistant.get("content") or "", provider.label
             )
-            for index in range(len(chat) - 1, -1, -1):
-                if chat[index]["role"] == "assistant":
-                    chat[index] = {"role": "assistant", "content": bubble}
-                    break
+            user_content = text.strip()
+            if len(updated) >= 2 and updated[-2].get("role") == "user":
+                user_content = updated[-2].get("content") or ""
+            chat.append({"role": "user", "content": user_content})
+            chat.append({"role": "assistant", "content": bubble})
         else:
             output = captured.strip("\n")
             if output:
@@ -195,14 +181,25 @@ def create_app(provider=None, memory=None, soul=None, speech=None, sources=None)
     return demo
 
 
+def _web_port():
+    raw = os.environ.get("TINYTALK_WEB_PORT", "").strip()
+    if raw:
+        try:
+            port = int(raw)
+        except ValueError:
+            port = 0
+        if 0 < port <= 65535:
+            return port
+    return 7861
+
+
 def main():
     try:
         app = create_app()
     except ConfigError as exc:
         print("Configuration error: %s" % exc)
         return 1
-    port = int(os.environ.get("TINYTALK_WEB_PORT", "7861"))
-    app.launch(share=False, server_name="127.0.0.1", server_port=port)
+    app.launch(share=False, server_name="127.0.0.1", server_port=_web_port())
     return 0
 
 

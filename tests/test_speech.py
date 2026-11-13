@@ -306,6 +306,18 @@ class SpeechCommandTests(unittest.TestCase):
         speech.join(2)
         self.assertEqual(client.calls, ["Typed reply"])
 
+    def test_afplay_raises_without_creating_temp_file_when_afplay_missing(self):
+        from unittest.mock import patch
+        from speech import Afplay
+
+        player = Afplay()
+        with (
+            patch("speech.shutil.which", return_value=None),
+            patch("speech.tempfile.mkstemp", side_effect=AssertionError("mkstemp should not run")),
+        ):
+            with self.assertRaises(FileNotFoundError):
+                player.play(b"RIFF-fake-wav", lambda: True)
+
 
 if __name__ == "__main__":
     unittest.main()
