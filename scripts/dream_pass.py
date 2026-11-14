@@ -18,7 +18,6 @@ search_facts returns at most three hits. A duplicate past that cutoff is missed.
 
 import argparse
 import io
-import os
 import sys
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -41,6 +40,7 @@ from memory_core import (
     _room_drawers,
     open_memory,
     read_current_profile,
+    scoped_io,
 )
 
 # Stricter than memory_core.MIN_FACT_SIMILARITY. search_facts already applies
@@ -56,22 +56,15 @@ class GraphReadError(Exception):
 
 def _call_quietly(function, *args):
     """Run function with debug off. Incidental prints go to stderr."""
-    previous = os.environ.get("TINYTALK_DEBUG")
-    os.environ["TINYTALK_DEBUG"] = ""
     captured = io.StringIO()
-    try:
-        with redirect_stdout(captured):
-            return function(*args)
-    finally:
-        if previous is None:
-            os.environ.pop("TINYTALK_DEBUG", None)
-        else:
-            os.environ["TINYTALK_DEBUG"] = previous
-        leaked = captured.getvalue()
-        if leaked:
-            sys.stderr.write(leaked)
-            if not leaked.endswith("\n"):
-                sys.stderr.write("\n")
+    with scoped_io(output=lambda line: None, debug=False), redirect_stdout(captured):
+        result = function(*args)
+    leaked = captured.getvalue()
+    if leaked:
+        sys.stderr.write(leaked)
+        if not leaked.endswith("\n"):
+            sys.stderr.write("\n")
+    return result
 
 
 def _filed_at(drawer):
@@ -446,6 +439,12 @@ def _parse_args(argv):
     return parser.parse_args(argv)
 
 
+def _close_memory(memory):
+    kg = getattr(memory, "kg", None)
+    if kg is not None and callable(getattr(kg, "close", None)):
+        kg.close()
+
+
 def main(argv=None, memory=None):
     """Report to stdout or --out. --apply APPROVALS_FILE retires those ids."""
     args = _parse_args(argv)
@@ -454,8 +453,17 @@ def main(argv=None, memory=None):
             "Use --out to write a report, or --apply to retire drawers, not both.\n"
         )
         return 2
-    if memory is None:
+    opened = memory is None
+    if opened:
         memory = _open_default_memory()
+    try:
+        return _run(args, memory)
+    finally:
+        if opened:
+            _close_memory(memory)
+
+
+def _run(args, memory):
     if args.apply:
         text = _read_text(args.apply, "the approvals file")
         if text is None:
@@ -466,7 +474,7 @@ def main(argv=None, memory=None):
         return 0 if ok else 1
     try:
         report = render_report(memory)
-    except GraphReadError as exc:
+    except (GraphReadError, RuntimeError) as exc:
         sys.stderr.write("%s\n" % exc)
         return 1
     if args.out:

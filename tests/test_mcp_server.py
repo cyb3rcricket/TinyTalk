@@ -210,6 +210,53 @@ class McpToolTests(unittest.TestCase):
         self.assertTrue(any("amber dock light" in excerpt.get("text", "") for excerpt in kept["excerpts"]))
         self.assertEqual(kept["excerpts"][0]["status"], "historical")
 
+    def test_search_labels_an_unclassified_hit(self):
+        written = mcp_server.save_memory(self.memory, Extractor("NONE"), "call me Al")
+        self.assertEqual(written["status"], "saved_as_written")
+        found = mcp_server.search_memories(self.memory, "call me Al")
+        self.assertEqual(self._profile("preferred_name", found["profile"])["state"], "missing")
+        self.assertTrue(found["semantic_facts"])
+        self.assertTrue(all(
+            hit["label"] == "unclassified saved text" for hit in found["semantic_facts"]
+        ))
+        self.assertNotIn("semantic fact", [hit["label"] for hit in found["semantic_facts"]])
+
+    def test_sync_thread_reports_unavailable_when_the_palace_is_closed(self):
+        self.memory.palace = None
+        result = mcp_server.sync_thread(
+            self.memory,
+            "Docking notes",
+            [
+                {"role": "user", "content": "The amber dock light is on"},
+                {"role": "assistant", "content": "I noted the amber dock light."},
+            ],
+            "field-notes",
+        )
+        self.assertEqual(result["error"], "Saved memory is unavailable.")
+        self.assertEqual(result["saved"], 0)
+
+    def test_recall_thread_filters_a_retired_fact_after_hydration(self):
+        provider = Extractor(triple("preferred_name", "Al"))
+        self.assertEqual(
+            mcp_server.save_memory(self.memory, provider, "call me Al\nstill Al")["status"],
+            "saved",
+        )
+        mcp_server.save_memory(
+            self.memory,
+            Extractor(triple("preferred_name", "Sam")),
+            "call me Sam",
+        )
+        self.memory.save_exchange("Remember this: call me Al", "short preview")
+        listed = self.memory.list_drawers(wing="tinytalk", room="conversations", limit=10)
+        drawer_id = listed["drawers"][0]["drawer_id"]
+        self.memory.update_drawer(
+            drawer_id,
+            content="User: Remember this: call me Al\nstill Al\n\nAssistant: short preview",
+        )
+        dropped = mcp_server.recall_thread(self.memory, "Remember this: call me Al")
+        for excerpt in dropped["excerpts"]:
+            self.assertNotIn("still Al", excerpt.get("text") or "")
+
     def test_list_sources_returns_the_stored_record(self):
         mcp_server.save_memory(
             self.memory,

@@ -440,6 +440,58 @@ class RecallCommandTests(unittest.TestCase):
         self.assertEqual(excerpt["status"], "historical")
         self.assertIn("Assistant: Your name is Tommi.", excerpt["text"])
 
+    def test_a_search_hit_without_metadata_stays_unclassified(self):
+        memory = GraphMemory()
+        memory.fact_hits = [{
+            "text": "call me Al",
+            "similarity": 1.0,
+            "source_file": "tinytalk?unclassified=1",
+            "source_path": "tinytalk?unclassified=1",
+        }]
+        _messages, sources = tinytalk.build_context("call me Al", [], memory)
+        hit = next(source for source in sources if source.get("text") == "call me Al")
+        self.assertEqual(hit["kind"], tinytalk.UNCLASSIFIED_KIND)
+        self.assertEqual(hit["status"], "unclassified")
+        self.assertNotEqual(hit["status"], "current")
+
+    def test_recall_filters_a_retired_fact_after_hydration(self):
+        memory = _willow()
+        memory.conversations = [{
+            "text": "User: Remember this: call me...",
+            "content_preview": "User: Remember this: call me...",
+            "similarity": 0.95,
+            "drawer_id": "drawer-long",
+        }]
+
+        def get_drawer(drawer_id):
+            if drawer_id == "drawer-long":
+                return {"content": "User: Remember this: call me Willow\nstill Willow"}
+            return GraphMemory.get_drawer(memory, drawer_id)
+
+        memory.get_drawer = get_drawer
+        memory.drawers["facts-history"] = [{
+            "drawer_id": "drawer-old-willow",
+            "content_preview": "call me Willow\nstill Willow",
+            "metadata": {"source_file": "tinytalk"},
+        }]
+        _messages, sources = tinytalk.recall_context("call me Willow", [], memory)
+        excerpts = [source for source in sources if source["kind"] == "conversation excerpt"]
+        self.assertEqual(excerpts, [])
+
+    def test_a_remember_this_command_clears_an_earlier_session_name(self):
+        messages = [
+            {"role": "user", "content": "call me River"},
+            {"role": "assistant", "content": "Okay."},
+            {"role": "user", "content": "Remember this: call me Willow"},
+        ]
+        self.assertIsNone(tinytalk._session_name_request(messages))
+        self.assertEqual(
+            tinytalk._session_name_request(messages + [
+                {"role": "user", "content": "call me Ada"},
+            ]),
+            "Ada",
+        )
+
     def test_opaque_history_cannot_become_the_current_name(self):
         memory = _willow()
         memory.conversations = [{

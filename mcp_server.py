@@ -81,8 +81,13 @@ def search_memories(memory, query):
     for hit in hits or []:
         if not isinstance(hit, dict):
             continue
+        source = memory_core._coerce_saved_fact(hit)
+        if source.get("kind") == memory_core.UNCLASSIFIED_KIND:
+            label = "unclassified saved text"
+        else:
+            label = "semantic fact"
         semantic_facts.append({
-            "label": "semantic fact",
+            "label": label,
             "similarity": hit.get("similarity"),
             "text": hit.get("text") or "",
         })
@@ -130,7 +135,11 @@ def sync_thread(memory, title, messages, source_app):
     parsed, error = _message_pairs(messages)
     if error is not None:
         return error
-    if memory is None or getattr(memory, "save_exchange", None) is None:
+    if (
+        memory is None
+        or getattr(memory, "palace", None) is None
+        or not callable(getattr(memory, "save_exchange", None))
+    ):
         return {"error": "Saved memory is unavailable.", "saved": 0, "skipped": 0}
 
     note = "Thread: %s (source: %s)" % (title, source_app)
@@ -174,12 +183,12 @@ def recall_thread(memory, query):
     for item in found:
         if not item or not memory_core._keep_conversation(item):
             continue
+        hydrated = memory_core._hydrate_conversation(memory, item)
         if (
-            memory_core._from_unfinished_command(item, updates)
-            or memory_core._from_retired_command(item, retired)
+            memory_core._from_unfinished_command(hydrated, updates)
+            or memory_core._from_retired_command(hydrated, retired)
         ):
             continue
-        hydrated = memory_core._hydrate_conversation(memory, item)
         excerpts.append(memory_core._historical_source(hydrated))
     return {"excerpts": excerpts}
 

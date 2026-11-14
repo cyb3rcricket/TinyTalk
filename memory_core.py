@@ -278,16 +278,22 @@ def _history_facts(drawers, predicate="test_spaceship_name"):
         if text is None:
             text = item.get("text") or ""
         text = text.strip()
-        if predicate == "test_spaceship_name":
-            # Keep the legacy spaceship parser and its results unchanged.
-            name = test_spaceship_fact_name(text)
-        else:
-            stored, name = _fact_relationship(item.get("metadata") or {})
+        metadata = item.get("metadata") or {}
+        if _is_unclassified(metadata):
+            continue
+        stored, name = _fact_relationship(metadata)
+        if stored:
             if _canon_predicate(stored) != predicate:
                 continue
             if not isinstance(name, str):
                 continue
             name = name.strip()
+        elif predicate == "test_spaceship_name":
+            # Legacy drawers have no relationship metadata. The spaceship
+            # parser is the fallback, and only when metadata names nothing.
+            name = test_spaceship_fact_name(text)
+        else:
+            continue
         if not name:
             continue
         filed_at = (item.get("metadata") or {}).get("filed_at")
@@ -700,10 +706,27 @@ def history_sources(evidence):
     return sources
 
 
+def _hit_metadata(item):
+    """Relationship metadata from a drawer or a search hit.
+
+    search_facts returns source_path (the stored source_file) and a basename
+    in source_file. It does not return a metadata dict.
+    """
+    if not isinstance(item, dict):
+        return {}
+    metadata = dict(item.get("metadata") or {})
+    if metadata.get("source_file"):
+        return metadata
+    source = item.get("source_path") or item.get("_source_file_full") or item.get("source_file")
+    if source and source != "?":
+        metadata["source_file"] = source
+    return metadata
+
+
 def _coerce_saved_fact(item):
     if isinstance(item, str):
         return _source("saved fact", item)
-    metadata = item.get("metadata") or {}
+    metadata = _hit_metadata(item)
     text = item.get("text") or item.get("content_preview") or ""
     room = item.get("room") or metadata.get("room")
     if room == "facts-history":
@@ -831,16 +854,23 @@ def _keep_conversation(hit):
 
 
 def _command_fact(text):
-    """The fact after the first "Remember this:", or None."""
+    """The fact after the first "Remember this:", or None.
+
+    Later lines stay in the fact. remember_fact stores that whole remainder,
+    so a multi-line fact must match the stored drawer text.
+    """
     raw = text or ""
     marker = "remember this:"
     start = raw.casefold().find(marker)
     if start == -1:
         return None
     rest = raw[start + len(marker):].strip()
-    if not rest:
-        return None
-    return rest.splitlines()[0].strip() or None
+    # A saved exchange appends the assistant reply after a blank line.
+    # The fact is the user text before that reply.
+    assistant = rest.casefold().find("\n\nassistant:")
+    if assistant != -1:
+        rest = rest[:assistant].strip()
+    return rest or None
 
 
 def _retired_fact_texts(memory):
@@ -1357,18 +1387,59 @@ def _attach_source_drawer(kg, triple_id, drawer_id):
         return False
 
 
-def _link_provenance(memory, links, obj, drawer_id):
-    """Attach the current fact drawer to an open edge that has no drawer yet.
+def _repoint_source_drawer(kg, triple_id, drawer_id, previous_id):
+    """Move one open triple from a stale drawer id to the current fact drawer."""
+    if kg is None or not triple_id or not drawer_id or not previous_id:
+        return False
+    if previous_id == drawer_id:
+        return True
+    try:
+        with kg._lock:
+            conn = kg._conn()
+            with conn:
+                updated = conn.execute(
+                    "UPDATE triples SET source_drawer_id = ? "
+                    "WHERE id = ? AND valid_to IS NULL AND source_drawer_id = ?",
+                    (drawer_id, triple_id, previous_id),
+                )
+                return updated.rowcount == 1
+    except Exception:
+        return False
 
+
+def _provenance_needs_repair(memory, link, drawer_id):
+    """True when an open edge names a drawer that is not the current fact."""
+    existing = link.get("source_drawer_id") or link.get("drawer_id")
+    if not existing or existing == drawer_id:
+        return False
+    try:
+        room = _drawer_room(memory, existing)
+    except Exception:
+        return True
+    return room in (None, PENDING_ROOM, ABANDONED_ROOM, HISTORY_ROOM)
+
+
+def _link_provenance(memory, links, obj, drawer_id):
+    """Attach the current fact drawer to the open edge for this value.
+
+    An empty source_drawer_id is filled. A pointer at facts-pending,
+    facts-abandoned, facts-history, or a missing drawer is replaced. A
+    pointer that already names a current facts drawer is left alone.
     Returns an incomplete status when the attach does not happen, or None.
     """
     if not getattr(memory, "provenance", True):
         return None
-    targets = [
-        link for link in links
-        if _names_match(link.get("object"), obj) and not link.get("source_drawer_id")
-    ]
-    if not targets:
+    targets = []
+    repairs = []
+    for link in links:
+        if not _names_match(link.get("object"), obj):
+            continue
+        existing = link.get("source_drawer_id") or link.get("drawer_id")
+        if not existing:
+            targets.append(link)
+        elif _provenance_needs_repair(memory, link, drawer_id):
+            repairs.append(link)
+    if not targets and not repairs:
         return None
     try:
         room = _drawer_room(memory, drawer_id)
@@ -1381,6 +1452,13 @@ def _link_provenance(memory, links, obj, drawer_id):
         )
     for link in targets:
         if not _attach_source_drawer(memory.kg, link.get("triple_id"), drawer_id):
+            return _pending(
+                "The graph link could not be attached to the saved fact. "
+                "Repeat the command to finish"
+            )
+    for link in repairs:
+        previous = link.get("source_drawer_id") or link.get("drawer_id")
+        if not _repoint_source_drawer(memory.kg, link.get("triple_id"), drawer_id, previous):
             return _pending(
                 "The graph link could not be attached to the saved fact. "
                 "Repeat the command to finish"
@@ -2019,6 +2097,94 @@ def _room_drawers(memory, room):
             return drawers
 
 
+def _repair_fact_metadata(memory, drawer, source):
+    """Write relationship metadata onto a current drawer that lacks it.
+
+    MemPalace's update_drawer changes content, wing, and room, not
+    source_file, and get_drawer returns only the source basename. The
+    stamp writes the full source_file on the stored palace row, then
+    checks that row. True only when the stored value matches.
+    """
+    drawer_id = drawer.get("drawer_id")
+    if not drawer_id:
+        return False
+    if _stored_source_file(memory, drawer_id) == source:
+        return True
+    if not callable(getattr(memory, "update_drawer", None)):
+        return _stamp_source_file(memory, drawer_id, source)
+    try:
+        updated = memory.update_drawer(drawer_id, content=drawer.get("text") or "")
+    except Exception:
+        updated = None
+    if not isinstance(updated, dict) or not updated.get("success"):
+        return _stamp_source_file(memory, drawer_id, source)
+    if _stored_source_file(memory, drawer_id) == source:
+        return True
+    return _stamp_source_file(memory, drawer_id, source)
+
+
+def _collection_for(memory):
+    """The collection the drawer tools write, or the store's palace."""
+    try:
+        mcp = _import_memory_tools()
+        collection = mcp._get_collection()
+    except Exception:
+        collection = None
+    if collection is not None:
+        return collection
+    return getattr(memory, "palace", None)
+
+
+def _result_field(found, name):
+    if found is None:
+        return []
+    if isinstance(found, dict):
+        return found.get(name) or []
+    return getattr(found, name, None) or []
+
+
+def _palace_metadata(memory, drawer_id):
+    """Stored metadata for one drawer, or None when the palace cannot be read."""
+    collection = _collection_for(memory)
+    if collection is None or not hasattr(collection, "get"):
+        return None
+    try:
+        found = collection.get(ids=[drawer_id], include=["metadatas"])
+    except Exception:
+        return None
+    ids = _result_field(found, "ids")
+    metadatas = _result_field(found, "metadatas")
+    if drawer_id not in ids or not metadatas:
+        return None
+    metadata = metadatas[0]
+    if not isinstance(metadata, dict):
+        return None
+    return dict(metadata)
+
+
+def _stored_source_file(memory, drawer_id):
+    metadata = _palace_metadata(memory, drawer_id)
+    if metadata is None:
+        return None
+    return metadata.get("source_file")
+
+
+def _stamp_source_file(memory, drawer_id, source):
+    """Set source_file on the palace row for one drawer. True when it matches after."""
+    collection = _collection_for(memory)
+    metadata = _palace_metadata(memory, drawer_id)
+    if collection is None or metadata is None or not hasattr(collection, "update"):
+        return False
+    if metadata.get("source_file") == source:
+        return True
+    metadata["source_file"] = source
+    try:
+        collection.update(ids=[drawer_id], metadatas=[metadata])
+    except Exception:
+        return False
+    return _stored_source_file(memory, drawer_id) == source
+
+
 def _store_drawer(memory, fact, predicate=None, obj=None, room=PENDING_ROOM):
     """Save the verbatim fact in room (facts-pending), unless the same text is already current.
 
@@ -2026,6 +2192,10 @@ def _store_drawer(memory, fact, predicate=None, obj=None, room=PENDING_ROOM):
     found in facts-history or facts-abandoned moves to room, so a restated
     value goes through the whole update again. A save into current facts does
     not pull a pending, historical, or abandoned drawer back into facts.
+    Matching text already in facts is reused. When this save names a
+    relationship, an unclassified or disagreeing drawer is repaired before
+    that reuse. A repair that does not land returns None so the caller does
+    not report a current fact whose metadata still disagrees.
     """
     target = room
     if predicate:
@@ -2037,8 +2207,15 @@ def _store_drawer(memory, fact, predicate=None, obj=None, room=PENDING_ROOM):
     try:
         if getattr(memory, "list_drawers", None) is not None:
             for drawer in _room_drawers(memory, FACT_ROOM):
-                if drawer["text"] == fact:
-                    return drawer["drawer_id"], FACT_ROOM
+                if drawer["text"] != fact:
+                    continue
+                if predicate and (
+                    _is_unclassified(drawer.get("metadata"))
+                    or not _metadata_agrees(drawer, _canon_predicate(predicate), obj)
+                ):
+                    if not _repair_fact_metadata(memory, drawer, source):
+                        return None
+                return drawer["drawer_id"], FACT_ROOM
     except Exception:
         return None
     try:

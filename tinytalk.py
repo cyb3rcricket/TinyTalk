@@ -186,6 +186,8 @@ def _session_name_request(messages):
     """Last unsaved 'call me' line in this chat, or None.
 
     Remember-this commands, questions, quotes, and coworker lines do not match.
+    A "Remember this:" line ends any earlier unsaved request. The permanent
+    save is the profile; a chat line from before that command is not.
     """
     found = None
     for message in messages or []:
@@ -193,6 +195,7 @@ def _session_name_request(messages):
             continue
         line = ((message or {}).get("content") or "").strip()
         if "remember this:" in line.casefold():
+            found = None
             continue
         if "?" in line or "coworker" in line.casefold():
             continue
@@ -252,7 +255,10 @@ def _semantic_sources(items):
             continue
         source = _coerce_saved_fact(item)
         source["selection"] = "semantic fact"
-        source["status"] = "current"
+        if source.get("kind") == UNCLASSIFIED_KIND:
+            source["status"] = "unclassified"
+        else:
+            source["status"] = "current"
         sources.append(source)
     return sources
 
@@ -347,9 +353,10 @@ def recall_context(query, messages, memory):
     for item in found:
         if not item or not _keep_conversation(item):
             continue
-        if _from_unfinished_command(item, updates) or _from_retired_command(item, retired):
+        hydrated = _hydrate_conversation(memory, item)
+        if _from_unfinished_command(hydrated, updates) or _from_retired_command(hydrated, retired):
             continue
-        excerpts.append(_historical_source(_hydrate_conversation(memory, item)))
+        excerpts.append(_historical_source(hydrated))
     lead = (
         "This context contains excerpts retrieved for this explicit recall. "
         "They are historical conversation text, not current profile facts. "
@@ -542,7 +549,7 @@ def _answer_from_profile(user_prompt, messages, provider, memory, sources, predi
     if sources is not None:
         sources.replace(_direct_sources(entry))
     messages.append({"role": "assistant", "content": answer})
-    messages = messages[-(MAX_TURNS * 2):]
+    messages = _mark_completed_turn(messages)
     emit("%s: %s" % (provider.label, answer))
     _save_turn(memory, user_prompt, answer)
     emit("-" * 30)
@@ -551,10 +558,18 @@ def _answer_from_profile(user_prompt, messages, provider, memory, sources, predi
 
 def _trim_before_user(messages):
     """Keep at most MAX_TURNS - 1 prior pairs so outgoing history starts on a user turn."""
-    trimmed = list(messages)[-(MAX_TURNS * 2 - 1):]
+    trimmed = [_chat_message(message) for message in list(messages)[-(MAX_TURNS * 2 - 1):]]
     while trimmed and trimmed[0].get("role") == "assistant":
         trimmed = trimmed[1:]
     return trimmed
+
+
+def _chat_message(message):
+    """Role and content only. A turn marker stays off the model request."""
+    return {
+        "role": (message or {}).get("role"),
+        "content": (message or {}).get("content") or "",
+    }
 
 
 def handle_turn(user_prompt, messages, provider, memory, soul, sources=None, output=None, debug=None):
@@ -593,7 +608,7 @@ def handle_turn(user_prompt, messages, provider, memory, soul, sources=None, out
         sources.replace(included)
 
     messages.append({"role": "assistant", "content": response})
-    messages = messages[-(MAX_TURNS * 2):]
+    messages = _mark_completed_turn(messages)
     emit("%s: %s" % (provider.label, response))
     # The reply was written before the fact was stored, so this line, not the
     # reply, says what happened to the memory. The conversation record is
@@ -634,7 +649,7 @@ def handle_recall(query, messages, provider, memory, soul, sources=None, output=
     if sources is not None:
         sources.replace(included)
     messages.append({"role": "assistant", "content": response})
-    messages = messages[-(MAX_TURNS * 2):]
+    messages = _mark_completed_turn(messages)
     emit("%s: %s" % (provider.label, response))
     _save_turn(memory, "/recall " + query, response)
     emit("-" * 30)
@@ -693,8 +708,12 @@ def handle_user_line(
             return messages
         emit(forget_profile_field(memory, parts[1])["message"])
         return messages
-    if lowered == "/recall" or lowered.startswith("/recall "):
-        query = user_prompt.strip()[len("/recall"):].strip()
+    if lowered == "/recall" or lowered.startswith("/recall"):
+        remainder = user_prompt.strip()[len("/recall"):]
+        if remainder and not remainder[0].isspace():
+            emit("Use /recall followed by what you want from earlier conversations.")
+            return messages
+        query = remainder.strip()
         if not query:
             emit("Use /recall followed by what you want from earlier conversations.")
             return messages
@@ -710,6 +729,26 @@ def handle_user_line(
         emit("Use /speak to play the last answer, or /stop to stop playback.")
         return messages
     return handle_turn(user_prompt, messages, provider, memory, soul, sources)
+
+
+def _close_memory(memory):
+    kg = getattr(memory, "kg", None)
+    if kg is not None and callable(getattr(kg, "close", None)):
+        kg.close()
+
+
+def _mark_completed_turn(messages):
+    """Keep the rolling window and mark the turn this call completed.
+
+    At MAX_TURNS the stored list can equal the list this call started from.
+    The mark is a new token each call, so a command that returns the same
+    list is not mistaken for a new turn. Commands do not set it.
+    """
+    kept = list(messages)[-(MAX_TURNS * 2):]
+    if kept:
+        kept[-1] = dict(kept[-1])
+        kept[-1]["turn_completed"] = object()
+    return kept
 
 
 def main():
@@ -734,7 +773,10 @@ def main():
         "or /sources to list memories included with the last answer."
     )
     print("-" * 30)
-    run_repl(provider, memory, soul, speech, sources, input)
+    try:
+        run_repl(provider, memory, soul, speech, sources, input)
+    finally:
+        _close_memory(memory)
     return 0
 
 
@@ -752,6 +794,8 @@ def run_repl(provider, memory, soul, speech, sources, read_line, messages=None):
             if user_prompt.strip().lower() == "quit":
                 print("Goodbye! 👋")
                 break
+            if not user_prompt.strip():
+                continue
             messages = handle_user_line(
                 user_prompt, messages, provider, memory, soul, speech, sources
             )

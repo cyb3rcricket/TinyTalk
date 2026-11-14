@@ -168,9 +168,9 @@ class Afplay(object):
             raise FileNotFoundError("afplay is not available on this system.")
         fd, path = tempfile.mkstemp(prefix="tinytalk-speech-", suffix=".wav")
         try:
-            os.write(fd, wav_bytes)
-            os.close(fd)
-            fd = None
+            with os.fdopen(fd, "wb") as handle:
+                fd = None
+                handle.write(wav_bytes)
             if not still_current():
                 return False
             proc = self._popen(
@@ -181,9 +181,13 @@ class Afplay(object):
             )
             with self._lock:
                 if not still_current():
-                    _terminate_process(proc)
-                    return False
-                self._proc = proc
+                    stale = proc
+                else:
+                    stale = None
+                    self._proc = proc
+            if stale is not None:
+                _terminate_process(stale)
+                return False
             code = proc.wait()
             with self._lock:
                 if self._proc is proc:

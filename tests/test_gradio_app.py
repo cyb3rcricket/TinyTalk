@@ -286,6 +286,31 @@ class GradioAppTests(unittest.TestCase):
         self.assertEqual(chat[2], {"role": "user", "content": "Hi"})
         self.assertEqual(chat[3], {"role": "assistant", "content": "Hello again."})
 
+    def test_a_repeated_turn_at_the_history_cap_stays_a_reply(self):
+        provider = ScriptedProvider(["Same reply."] * 12)
+        app = self._app(provider)
+        sources = tinytalk.SessionSources()
+        messages = []
+        chat = []
+        for index in range(tinytalk.MAX_TURNS + 1):
+            chat, messages, sources, _box = _submit(
+                app, "Same line", messages, sources, chat=chat
+            )
+            self.assertEqual(chat[-1]["content"], "Same reply.")
+            self.assertNotIn("Script:", chat[-1]["content"])
+            self.assertNotIn("-" * 30, chat[-1]["content"])
+            self.assertTrue(messages[-1].get("turn_completed"))
+            self.assertEqual(len(messages), min((index + 1) * 2, tinytalk.MAX_TURNS * 2))
+
+    def test_main_closes_the_knowledge_graph(self):
+        app = unittest.mock.Mock()
+        memory = unittest.mock.Mock()
+        app._tinytalk_memory = memory
+        with unittest.mock.patch("gradio_app.create_app", return_value=app):
+            code = gradio_app.main()
+        self.assertEqual(code, 0)
+        memory.kg.close.assert_called_once_with()
+
     def test_submit_does_not_mutate_debug_env_or_leak_debug(self):
         fact = "my home city is Austin"
         provider = TextProvider({fact: triple("home_city", "Austin")}, reply="Noted.")

@@ -680,6 +680,62 @@ class FactReplacementTests(unittest.TestCase):
         self.assertEqual(self.rooms()["facts-pending"], [])
         self.assertEqual(self.memory.current_fact_objects("user", "preferred_name"), ["Sam"])
 
+    def test_retrying_the_same_words_repairs_unclassified_metadata(self):
+        provider = self.provider()
+        provider.answers["call me Al"] = "not json"
+        written = remember(self.memory, provider, "call me Al")
+        self.assertEqual(written["status"], "saved_as_written")
+        provider.answers["call me Al"] = triple("preferred_name", "Al")
+
+        saved = remember(self.memory, provider, "call me Al")
+
+        self.assertEqual(saved, {"status": "saved", "message": "Memory: saved."})
+        entry = next(
+            item for item in tinytalk.read_current_profile(self.memory)
+            if item["predicate"] == "preferred_name"
+        )
+        self.assertEqual(entry["state"], "current")
+        self.assertEqual(entry["value"], "Al")
+        self.assertEqual(entry["source_text"], "call me Al")
+        drawers = tinytalk._room_drawers(self.memory, "facts")
+        self.assertEqual([drawer["text"] for drawer in drawers], ["call me Al"])
+        self.assertFalse(tinytalk._is_unclassified(drawers[0]["metadata"]))
+
+    def test_a_paraphrased_retry_repairs_an_abandoned_graph_pointer(self):
+        provider = self.provider(**{
+            "call me Bob": triple("preferred_name", "Bob"),
+            "call me Ada": triple("preferred_name", "Ada"),
+            "my preferred name is Ada": triple("preferred_name", "Ada"),
+        })
+        self.assertEqual(remember(self.memory, provider, "call me Bob")["status"], "saved")
+        real_update = self.memory.update_drawer
+
+        def fail_promote(drawer_id, **kwargs):
+            if kwargs.get("room") == "facts":
+                return {"success": False}
+            return real_update(drawer_id, **kwargs)
+
+        self.memory.update_drawer = fail_promote
+        pending = remember(self.memory, provider, "call me Ada")
+        self.assertEqual(pending["status"], "incomplete")
+        self.memory.update_drawer = real_update
+
+        saved = remember(self.memory, provider, "my preferred name is Ada")
+
+        self.assertEqual(saved, {"status": "saved", "message": "Memory: saved."})
+        entry = next(
+            item for item in tinytalk.read_current_profile(self.memory)
+            if item["predicate"] == "preferred_name"
+        )
+        self.assertEqual(entry["state"], "current")
+        self.assertEqual(entry["value"], "Ada")
+        self.assertEqual(entry["source_text"], "my preferred name is Ada")
+        self.assertIn("my preferred name is Ada", self.rooms()["facts"])
+        self.assertNotIn(entry["source_drawer_id"], [
+            drawer["drawer_id"]
+            for drawer in tinytalk._room_drawers(self.memory, "facts-abandoned")
+        ])
+
     def test_unclassified_text_stays_out_of_the_single_value_fact(self):
         provider = self.provider()
         provider.answers["call me Al"] = "not json"

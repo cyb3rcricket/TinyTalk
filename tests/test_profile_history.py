@@ -205,6 +205,24 @@ class ProfileHistoryEvidenceTests(unittest.TestCase):
         self.assertIsNone(evidence["previous_name"])
         self.assertNotIn("Austin", core.format_profile_history(evidence, "home_city"))
 
+    def test_spaceship_history_prefers_metadata_over_the_legacy_parser(self):
+        drawers = [
+            {"drawer_id": "meta", "room": "facts-history",
+             "text": "the old test spaceship was named Serenity",
+             "metadata": {"source_file": core._fact_source_file("test_spaceship_name", "Nostromo")}},
+            {"drawer_id": "legacy", "room": "facts-history",
+             "text": "my test spaceship is named Serenity",
+             "metadata": {"source_file": "tinytalk"}},
+            {"drawer_id": "unclassified", "room": "facts-history",
+             "text": "my test spaceship is named Defiant",
+             "metadata": {"source_file": core._fact_source_file(unclassified=True)}},
+        ]
+        facts = core._history_facts(drawers, "test_spaceship_name")
+        self.assertEqual(
+            [(fact["id"], fact["name"]) for fact in facts],
+            [("meta", "Nostromo"), ("legacy", "Serenity")],
+        )
+
     def test_duplicate_current_value_is_not_previous(self):
         evidence = core.profile_history_evidence(
             [edge("Nashville", True), edge("Nashville", False)], [], "home_city", "",

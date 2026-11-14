@@ -2,6 +2,7 @@
 
 import os
 import sys
+import threading
 from pathlib import Path
 
 import gradio as gr
@@ -44,8 +45,26 @@ def _visible_messages(messages):
     return visible
 
 
+def _completed_this_call(before, after):
+    """True when this call marked a new completed turn."""
+    if not after or after[-1].get("role") != "assistant":
+        return False
+    token = after[-1].get("turn_completed")
+    if token is None:
+        return False
+    earlier = before[-1].get("turn_completed") if before else None
+    return token is not earlier
+
+
 def _appended_assistant(before, after):
-    """The assistant message this call added, or None for commands and errors."""
+    """The assistant message this call added, or None for commands and errors.
+
+    A completed turn marks its last message with a new token. At the
+    rolling-window cap the stored list can otherwise equal the list this
+    call started from. A command returns the earlier token and is not a turn.
+    """
+    if _completed_this_call(before, after):
+        return after[-1]
     if after == before:
         return None
     if not after or after[-1].get("role") != "assistant":
@@ -112,6 +131,7 @@ def create_app(provider=None, memory=None, soul=None, speech=None, sources=None)
         speech = NoOpSpeech()
     if sources is None:
         sources = SessionSources()
+    memory_lock = threading.Lock()
 
     def submit_message(text, chat, messages, sources_state):
         if sources_state is None:
@@ -127,16 +147,17 @@ def create_app(provider=None, memory=None, soul=None, speech=None, sources=None)
         else:
             messages = list(messages)
         before = list(messages)
-        updated, captured = _call_quietly(
-            handle_user_line,
-            text,
-            messages,
-            provider,
-            memory,
-            soul,
-            speech,
-            sources_state,
-        )
+        with memory_lock:
+            updated, captured = _call_quietly(
+                handle_user_line,
+                text,
+                messages,
+                provider,
+                memory,
+                soul,
+                speech,
+                sources_state,
+            )
         chat = _visible_messages(before) if chat is None else list(chat)
         assistant = _appended_assistant(before, updated)
         if assistant is not None:
@@ -178,6 +199,7 @@ def create_app(provider=None, memory=None, soul=None, speech=None, sources=None)
             clear_conversation,
             outputs=[chatbot, messages_state, sources_state, textbox],
         )
+    demo._tinytalk_memory = memory
     return demo
 
 
@@ -194,13 +216,19 @@ def _web_port():
 
 
 def main():
+    memory = None
     try:
-        app = create_app()
-    except ConfigError as exc:
-        print("Configuration error: %s" % exc)
-        return 1
-    app.launch(share=False, server_name="127.0.0.1", server_port=_web_port())
-    return 0
+        try:
+            app = create_app()
+        except ConfigError as exc:
+            print("Configuration error: %s" % exc)
+            return 1
+        memory = getattr(app, "_tinytalk_memory", None)
+        app.launch(share=False, server_name="127.0.0.1", server_port=_web_port())
+        return 0
+    finally:
+        from tinytalk import _close_memory
+        _close_memory(memory)
 
 
 if __name__ == "__main__":

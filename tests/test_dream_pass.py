@@ -448,6 +448,21 @@ class DreamPassTests(unittest.TestCase):
         self.assertIn(dune, duplicate_section)
         self.assertIn(dune_again, duplicate_section)
 
+    def test_a_drawer_read_failure_is_a_clean_error(self):
+        real = self.memory.list_drawers
+
+        def fail_list(*args, **kwargs):
+            return {"error": "palace locked"}
+
+        self.memory.list_drawers = fail_list
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), patch("sys.stderr", err):
+            code = dream_pass.main([], memory=self.memory)
+        self.memory.list_drawers = real
+        self.assertEqual(code, 1)
+        self.assertIn("could not list", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+
     def test_apply_approvals_reads_drawers_once(self):
         first_id = add_fact(self.memory, "first cached note", predicate="cache_note", obj="one")
         second_id = add_fact(self.memory, "second cached note", predicate="cache_note", obj="two")

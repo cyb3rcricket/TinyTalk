@@ -653,6 +653,34 @@ class RoutingAndContextTests(unittest.TestCase):
         with unittest.mock.patch.dict(os.environ, {"TINYTALK_MAX_REQUEST_CHARS": "1000"}):
             self.assertEqual(tinytalk.request_char_limit(), tinytalk.MAX_REQUEST_CHARS)
 
+    def test_blank_repl_line_is_ignored(self):
+        player = StopPlayer()
+        speech = SpeechController(object(), player, lambda _m: None)
+        provider = ScriptedProvider(["should not be called"])
+        lines = iter(["   ", "quit"])
+        shown = io.StringIO()
+        with redirect_stdout(shown):
+            updated = tinytalk.run_repl(
+                provider, None, "SOUL", speech, None, lambda _p: next(lines)
+            )
+        self.assertEqual(updated, [])
+        self.assertEqual(provider.calls, [])
+
+    def test_recallfoo_is_not_a_chat_prompt(self):
+        provider = ScriptedProvider(["From recall."])
+        shown = io.StringIO()
+        with redirect_stdout(shown):
+            rejected = tinytalk.handle_user_line(
+                "/recallfoo", [], provider, None, "SOUL", None
+            )
+            recalled = tinytalk.handle_user_line(
+                "/recall\twhat did we say", [], provider, None, "SOUL", None
+            )
+        self.assertEqual(rejected, [])
+        self.assertEqual(provider.calls[0][-1]["content"], "/recall what did we say")
+        self.assertEqual(recalled[-2]["content"], "/recall what did we say")
+        self.assertIn("Use /recall followed by", shown.getvalue())
+
     def test_run_repl_exits_on_quit_with_surrounding_whitespace(self):
         player = StopPlayer()
         speech = SpeechController(object(), player, lambda _m: None)

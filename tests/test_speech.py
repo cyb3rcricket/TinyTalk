@@ -5,6 +5,7 @@ import os
 import sys
 import threading
 import unittest
+import unittest.mock
 from pathlib import Path
 
 import httpx
@@ -305,6 +306,60 @@ class SpeechCommandTests(unittest.TestCase):
         speech.speak_last(updated)
         speech.join(2)
         self.assertEqual(client.calls, ["Typed reply"])
+
+    def test_afplay_writes_the_whole_wav_and_releases_the_lock_before_stopping(self):
+        import speech as speech_module
+        from speech import Afplay
+
+        written = {}
+
+        class Handle(object):
+            def __init__(self, fd):
+                written["fd"] = fd
+                written["chunks"] = []
+
+            def write(self, data):
+                written["chunks"].append(data)
+                return len(data)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                written["closed"] = True
+                return False
+
+        class Proc(object):
+            pid = 4242
+
+            def poll(self):
+                return None
+
+            def wait(self, timeout=None):
+                return 0
+
+        stopped = {}
+
+        def terminate(proc):
+            stopped["held"] = player._lock.locked()
+            stopped["proc"] = proc
+
+        player = Afplay(popen=lambda *args, **kwargs: Proc())
+        checks = {"count": 0}
+
+        def still_current():
+            checks["count"] += 1
+            return checks["count"] < 3
+
+        with unittest.mock.patch("speech.os.fdopen", side_effect=lambda fd, mode: Handle(fd)):
+            with unittest.mock.patch("speech.os.remove"):
+                with unittest.mock.patch.object(speech_module, "_terminate_process", terminate):
+                    played = player.play(b"RIFF-whole-wav", still_current)
+        self.assertFalse(played)
+        self.assertEqual(written["chunks"], [b"RIFF-whole-wav"])
+        self.assertTrue(written["closed"])
+        self.assertFalse(stopped["held"])
+        self.assertIsInstance(stopped["proc"], Proc)
 
     def test_afplay_raises_without_creating_temp_file_when_afplay_missing(self):
         from unittest.mock import patch
