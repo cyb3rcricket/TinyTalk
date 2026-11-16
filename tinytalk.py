@@ -2,6 +2,7 @@ import os
 import sys
 from pathlib import Path
 
+import web_search
 from provider import ConfigError, ProviderError, build_provider, load_settings
 from speech import Afplay, SpeechController, VoiceStudioSpeech, command_kind, speech_settings
 
@@ -65,6 +66,7 @@ from memory_core import (
     _from_retired_command,
     SessionSources,
     format_sources_report,
+    web_source_record,
     _load_test_spaceship_records,
     _unsettled_row,
     historical_context_message,
@@ -129,6 +131,9 @@ from memory_core import (
     _profile_entry_for,
     _direct_sources,
 )
+
+# The handle_* debug parameter shadows this name. Keep a function alias.
+log_debug = debug
 
 MAX_TURNS = 10
 # Characters of text in one outgoing request: soul, memory, history, and the
@@ -624,6 +629,128 @@ def handle_turn(user_prompt, messages, provider, memory, soul, sources=None, out
     return messages
 
 
+def format_web_prompt(records):
+    """Numbered live pages plus the citation rule. Not a memory block."""
+    retrieved = ""
+    if records:
+        retrieved = records[0].get("retrieved_at") or ""
+    lines = [
+        "WEB SOURCES (retrieved %s — live web results, not saved memories)" % retrieved,
+    ]
+    for source in records:
+        lines.append("[%s] %s — %s" % (
+            source.get("number"),
+            source.get("title") or "",
+            source.get("url") or "",
+        ))
+        if source.get("snippet_only"):
+            lines.append("snippet only")
+        lines.append(source.get("text") or "")
+    lines.append(
+        "Cite every web-derived claim with its [n]. "
+        "Use only the given URLs and never invent one. "
+        "If these sources do not answer, say so instead of silently filling from training."
+    )
+    return "\n".join(lines)
+
+
+def _profile_for_search(messages, memory):
+    """Current profile only.
+
+    Semantic fact search stays out. An explicit web lookup should not also
+    pull in similarity-matched memories and present them beside live pages.
+    """
+    unfinished, _updates = unfinished_memory(memory)
+    profile, session_name = _profile_block(memory, messages, unfinished)
+    return _deliver_memory(
+        "This context contains the saved facts retrieved for this request.",
+        profile,
+        [],
+        messages,
+        session_name,
+    )
+
+
+def _compose_search_request(profile_messages, profile_sources, web_records):
+    """Profile block, then the web block, then the chat.
+
+    fit_outgoing keeps the first system message only when sources are
+    non-empty, and always keeps later system messages. An empty anchor
+    stands in front when there is no profile to keep, so the web block
+    is not dropped.
+    """
+    web = {"role": "system", "content": format_web_prompt(web_records)}
+    has_head = bool(profile_messages) and profile_messages[0].get("role") == "system"
+    head = profile_messages[0] if has_head else None
+    tail = list(profile_messages[1:] if has_head else profile_messages)
+    if profile_sources and head is not None:
+        return [head, web] + tail
+    request = [{"role": "system", "content": ""}, web]
+    if head is not None:
+        request.append(head)
+    request.extend(tail)
+    return request
+
+
+def handle_search(query, messages, provider, memory, soul, sources=None, output=None, debug=None):
+    """Answer /search from live pages. This does not write memory."""
+    if output is not None or debug is not None:
+        with scoped_io(output=output, debug=debug):
+            return handle_search(query, messages, provider, memory, soul, sources)
+    prior = list(messages)
+    if not web_search.configured():
+        emit(web_search.NOT_CONFIGURED_MESSAGE)
+        return prior
+    try:
+        found = web_search.search(query, debug_log=log_debug)
+    except web_search.WebSearchError as exc:
+        if exc.detail:
+            log_debug(exc.detail)
+        emit("%s" % exc)
+        return prior
+    messages = _trim_before_user(messages)
+    messages.append({"role": "user", "content": "/search " + query})
+    profile_messages, profile_sources = _profile_for_search(messages, memory)
+    web_records = [
+        web_source_record(
+            source.number,
+            source.title,
+            source.url,
+            source.excerpt,
+            source.retrieved,
+            source.snippet_only,
+        )
+        for source in found
+    ]
+    kept = list(web_records)
+    fitted = None
+    while kept:
+        request = _compose_search_request(profile_messages, profile_sources, kept)
+        fitted = fit_outgoing(soul, request, profile_sources)
+        if fitted is not None:
+            break
+        kept = kept[:-1]
+    if fitted is None or not kept:
+        emit(
+            "That message is too long for the %d-character request limit. Nothing was saved."
+            % request_char_limit()
+        )
+        return prior
+    request_messages, included = fitted
+    try:
+        response = provider.complete(model_messages(soul, request_messages))
+    except ProviderError as exc:
+        emit("%s Nothing was saved." % exc)
+        return prior
+    if sources is not None:
+        sources.replace(list(included) + kept)
+    messages.append({"role": "assistant", "content": response})
+    messages = _mark_completed_turn(messages)
+    emit("%s: %s" % (provider.label, response))
+    emit("-" * 30)
+    return messages
+
+
 def handle_recall(query, messages, provider, memory, soul, sources=None, output=None, debug=None):
     """Answer /recall from historical excerpts. This does not write a fact."""
     if output is not None or debug is not None:
@@ -718,6 +845,16 @@ def handle_user_line(
             emit("Use /recall followed by what you want from earlier conversations.")
             return messages
         return handle_recall(query, messages, provider, memory, soul, sources)
+    if lowered == "/search" or lowered.startswith("/search"):
+        remainder = user_prompt.strip()[len("/search"):]
+        if remainder and not remainder[0].isspace():
+            emit("Use /search followed by what you want to look up on the web.")
+            return messages
+        query = remainder.strip()
+        if not query:
+            emit("Use /search followed by what you want to look up on the web.")
+            return messages
+        return handle_search(query, messages, provider, memory, soul, sources)
     kind = command_kind(user_prompt)
     if kind == "speak":
         speech.speak_last(messages)
