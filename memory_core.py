@@ -908,6 +908,28 @@ class SessionSources(object):
         self.records = list(records or [])
 
 
+# Explicit /search results. Not saved memories, and not written to MemPalace.
+WEB_SOURCE_KIND = "web source"
+WEB_SOURCE_SELECTION = "explicit web search"
+
+
+def web_source_record(number, title, url, excerpt, retrieved_at, snippet_only=False):
+    """One web result supplied with an answer.
+
+    retrieved_at is when the page was fetched. It is not when a fact changed.
+    """
+    return {
+        "kind": WEB_SOURCE_KIND,
+        "selection": WEB_SOURCE_SELECTION,
+        "text": excerpt or "",
+        "number": number,
+        "title": title or "",
+        "url": url or "",
+        "retrieved_at": retrieved_at,
+        "snippet_only": bool(snippet_only),
+    }
+
+
 def format_sources_report(records):
     records = list(records or [])
     if not records:
@@ -916,6 +938,18 @@ def format_sources_report(records):
             "That does not mean no memories exist, and it does not mean the "
             "answer came only from model knowledge."
         )
+    memory = [source for source in records if source.get("kind") != WEB_SOURCE_KIND]
+    web = [source for source in records if source.get("kind") == WEB_SOURCE_KIND]
+    parts = []
+    if memory:
+        parts.append(_format_memory_sources_report(memory))
+    if web:
+        parts.append(_format_web_sources_report(web))
+    return "\n\n".join(parts)
+
+
+def _format_memory_sources_report(records):
+    """Saved-memory wording. Unchanged when the answer had no web sources."""
     lines = [
         "These saved memories were included in the context for the last "
         "successful answer. TinyTalk does not claim the model used every one."
@@ -941,6 +975,32 @@ def format_sources_report(records):
             lines.append("graph valid_to: %s" % source["valid_to"])
         if source.get("valid_from") or source.get("valid_to"):
             lines.append("A graph time is not necessarily when the fact changed.")
+        lines.append(_preview(source.get("text") or ""))
+    return "\n".join(lines)
+
+
+def _format_web_sources_report(records):
+    """Live pages supplied with the answer. Separate from saved memories."""
+    lines = [
+        "These web sources were included with the last successful answer. "
+        "They are live web results, not saved memories. "
+        "TinyTalk does not claim the model used every one."
+    ]
+    for source in records:
+        lines.append("%s. %s" % (source.get("number"), WEB_SOURCE_KIND))
+        if source.get("selection"):
+            lines.append("selection: %s" % source["selection"])
+        if source.get("title"):
+            lines.append("title: %s" % source["title"])
+        if source.get("url"):
+            lines.append("url: %s" % source["url"])
+        if source.get("retrieved_at"):
+            lines.append("retrieved: %s" % source["retrieved_at"])
+            lines.append(
+                "This is when the page was retrieved, not when a fact changed."
+            )
+        if source.get("snippet_only"):
+            lines.append("snippet only")
         lines.append(_preview(source.get("text") or ""))
     return "\n".join(lines)
 

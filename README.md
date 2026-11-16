@@ -714,6 +714,28 @@ I don't want to bolt something onto the project just because I can.
 
 ---
 
+## Live web search (`/search`)
+
+Ordinary questions do not search the web. I have to ask:
+
+```text
+/search when was the first cricket world cup
+```
+
+`/search` with no query prints usage and stops. Nothing is searched, and the model is not called.
+
+TinyTalk does not ship a search service. It reads `SEARXNG_URL` and talks to a SearxNG instance I run myself. JSON format has to be on in that instance (`search.formats: [html, json]`). A local one:
+
+```text
+docker run -d -p 8888:8080 searxng/searxng
+```
+
+Retrieval happens before the model call. The pages come back as numbered excerpts, and the answer is supposed to cite them as `[1]`, `[2]`. `/sources` lists those web sources apart from saved memories. The retrieved time is when the page was fetched, not when a fact changed.
+
+None of that is written to MemPalace. A web result is not a memory.
+
+---
+
 # Why I'm building this
 
 I'm not really trying to make another ChatGPT.
